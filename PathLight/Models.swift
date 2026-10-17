@@ -12,13 +12,19 @@ struct Obstacle: Identifiable {
     var name: String
     var side: Side
     var distance: Double
+    var bounds: CGRect = .zero
+    var worldPosition: SIMD3<Float> = .zero
     var id: String { name + side.rawValue }
     var phrase: String {
         "\(name), \(String(format: "%.1f", distance)) meters, \(side == .center ? "ahead" : "on your " + side.rawValue)"
     }
 }
 
-enum WalkKind: String, Codable { case baseline, assessment }
+enum WalkKind: String, Codable {
+    case baseline, assessment
+    var duration: Double { self == .baseline ? 5 : 30 }
+    var minimumDuration: Double { self == .baseline ? 5 : 25 }
+}
 
 struct WalkSample: Codable {
     let time: Double
@@ -43,6 +49,7 @@ struct WalkRecord: Codable, Identifiable {
     let baselineID: UUID?
     let device: String
     let notes: String
+    var algorithmVersion: Int? = nil
 
     var validSeconds: Double { samples.reduce(0) { $0 + $1.interval } }
     var coverage: Double { min(1, validSeconds / max(duration, 0.001)) }
@@ -68,7 +75,7 @@ struct WalkRecord: Codable, Identifiable {
     }
     var qualityIssues: [String] {
         var issues: [String] = []
-        if duration < 25 { issues.append("Record at least 25 seconds.") }
+        if duration < kind.minimumDuration { issues.append("Record at least \(Int(kind.minimumDuration)) seconds.") }
         if coverage < 0.7 { issues.append("Too little usable position tracking (minimum 70%).") }
         if motionCoverage < 0.7 { issues.append("Too little usable motion data (minimum 70%).") }
         if movingFraction < 0.6 { issues.append("Too little walking in the recording (minimum 60%).") }
@@ -89,6 +96,9 @@ struct Comparison {
         var issues = baseline.qualityIssues.map { "Baseline: " + $0 }
         issues += current.qualityIssues.map { "Assessment: " + $0 }
         if current.baselineID != baseline.id { issues.append("The selected baseline does not match this assessment.") }
+        if (baseline.algorithmVersion ?? 1) != (current.algorithmVersion ?? 1) {
+            issues.append("Speed tracking changed. Record a new baseline using this app version.")
+        }
         if abs(current.meanTilt - baseline.meanTilt) > 15 {
             issues.append("Phone tilt differs by more than 15 degrees. Match harness placement and repeat.")
         }

@@ -48,7 +48,9 @@ struct NavigateView: View {
                 }
                 if model.running {
                     CameraPreview(model: model)
-                        .frame(height: 220).clipShape(RoundedRectangle(cornerRadius: 24))
+                        .frame(height: 300)
+                        .overlay { TargetOverlay(target: model.obstacles.first) }
+                        .clipShape(RoundedRectangle(cornerRadius: 24))
                         .overlay(alignment: .bottomLeading) {
                             Text("LIVE · REAR CAMERA").font(.caption.bold()).padding(10).background(.black.opacity(0.7)).clipShape(Capsule()).padding()
                         }.accessibilityLabel("Live rear camera preview")
@@ -61,12 +63,14 @@ struct NavigateView: View {
                 }.buttonStyle(.borderedProminent).tint(model.running ? .orange : mint).foregroundStyle(ink)
                     .disabled(!model.acknowledged)
                 VStack(alignment: .leading, spacing: 14) {
-                    Text("NEARBY SURFACES").font(.caption.bold()).foregroundStyle(mint)
+                    Text("SELECTED SURFACE").font(.caption.bold()).foregroundStyle(mint)
+                    Text(model.detectionCooldown > 0 ? "One target · next selection in \(model.detectionCooldown)s" : "Looking for one nearby target")
+                        .font(.footnote).foregroundStyle(.secondary)
                     if model.obstacles.isEmpty {
                         Text(model.running ? "No reliable reading right now" : "Start scanning to see nearby surfaces").font(.title3)
                         Text("No reading does not mean the path is clear.").foregroundStyle(.secondary)
                     } else {
-                        ForEach(Array(model.obstacles.prefix(5))) { obstacle in
+                        ForEach(model.obstacles) { obstacle in
                             HStack {
                                 Image(systemName: obstacle.side == .left ? "arrow.left" : obstacle.side == .right ? "arrow.right" : "arrow.up")
                                     .font(.title2).foregroundStyle(mint).frame(width: 30).accessibilityHidden(true)
@@ -79,7 +83,7 @@ struct NavigateView: View {
                             }.accessibilityElement(children: .ignore).accessibilityLabel(obstacle.phrase)
                         }
                     }
-                    Text("Approximate camera-to-surface distance, not body clearance.").font(.footnote).foregroundStyle(.secondary)
+                    Text("The box marks an approximate detected surface region. Distance is from the camera, not body clearance.").font(.footnote).foregroundStyle(.secondary)
                 }.card()
                 VStack(alignment: .leading, spacing: 14) {
                     HStack {
@@ -115,15 +119,16 @@ struct WalkingView: View {
                 Text("Your walk.\nYour reference.").font(.largeTitle.bold())
                 Text("Compare two short walks under similar conditions.").foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 12) {
-                    Label("30-second level walk", systemImage: "figure.walk").font(.title3.bold())
+                    Label("5-second baseline · 30-second comparison", systemImage: "figure.walk").font(.title3.bold())
                     Text("Mount the phone upright in portrait, with its rear camera facing forward and the lenses uncovered. Use a clear, well-lit, level route. Keep the same harness height, tilt, footwear, and comfortable pace for both walks. Pause at the end; do not deliberately limp for the demo.")
-                    Text("Start sensors in Navigate first. Stand ready, then use the five-second countdown. Fast turns and poor tracking are excluded.").foregroundStyle(.secondary)
+                    Text("Start sensors in Navigate first. Begin walking during the five-second countdown, then keep your usual pace while recording. Fast turns and poor tracking are excluded.").foregroundStyle(.secondary)
                 }.card()
                 HStack {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("TRACKED SPEED").font(.caption.bold()).foregroundStyle(mint)
                         Text(model.speed.map { String(format: "%.2f m/s", $0) } ?? "—")
                             .font(.largeTitle.monospacedDigit().bold())
+                        Text(model.speedNote).font(.footnote).foregroundStyle(.secondary)
                     }
                     Spacer()
                     Image(systemName: "waveform.path").font(.system(size: 35)).foregroundStyle(mint).accessibilityHidden(true)
@@ -137,7 +142,7 @@ struct WalkingView: View {
                     }
                 if busy {
                     VStack(spacing: 14) {
-                        Text(model.countdown > 0 ? "Get ready" : "Walk at your usual pace").font(.title2.bold())
+                        Text(model.countdown > 0 ? "Begin walking · settling in" : "Walk at your usual pace").font(.title2.bold())
                         Text("\(model.countdown > 0 ? model.countdown : model.remaining)")
                             .font(.system(size: 70, weight: .bold, design: .rounded).monospacedDigit())
                             .accessibilityLabel("\(model.countdown > 0 ? model.countdown : model.remaining) seconds remaining")
@@ -159,6 +164,9 @@ struct WalkingView: View {
                 }
                 if let baseline = model.saved.baseline {
                     Label("Baseline saved \(baseline.date.formatted(date: .abbreviated, time: .shortened))", systemImage: "checkmark.circle.fill").foregroundStyle(mint)
+                    if (baseline.algorithmVersion ?? 1) < 2 {
+                        Text("Replace your baseline to use the updated speed tracking.").foregroundStyle(.orange)
+                    }
                 }
                 Text("Movement changes can have many causes. This prototype does not detect arthritis or measure joint health.").font(.footnote).foregroundStyle(.secondary)
             }.padding(20)
@@ -227,7 +235,10 @@ struct ReportsView: View {
 private struct CameraPreview: UIViewRepresentable {
     let model: AppModel
     func makeUIView(context: Context) -> ARSCNView {
-        let view = ARSCNView(frame: .zero)
+        let view = CameraSurface(frame: .zero)
+        view.sizeChanged = { size in
+            DispatchQueue.main.async { model.previewSize = size }
+        }
         view.session = model.session
         view.session.delegateQueue = .main
         view.session.delegate = model
@@ -236,6 +247,41 @@ private struct CameraPreview: UIViewRepresentable {
         return view
     }
     func updateUIView(_ view: ARSCNView, context: Context) {}
+}
+
+private final class CameraSurface: ARSCNView {
+    var sizeChanged: ((CGSize) -> Void)?
+    private var previousSize = CGSize.zero
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if bounds.size != previousSize, bounds.width > 1, bounds.height > 1 {
+            previousSize = bounds.size
+            sizeChanged?(bounds.size)
+        }
+    }
+}
+
+private struct TargetOverlay: View {
+    let target: Obstacle?
+    var body: some View {
+        GeometryReader { geometry in
+            if let target = target {
+                let box = CGRect(x: target.bounds.minX * geometry.size.width,
+                                 y: target.bounds.minY * geometry.size.height,
+                                 width: target.bounds.width * geometry.size.width,
+                                 height: target.bounds.height * geometry.size.height)
+                ZStack(alignment: .topLeading) {
+                    Path { $0.addRect(box) }.stroke(mint, lineWidth: 3)
+                    Text("\(target.name) · \(String(format: "%.1f m", target.distance))")
+                        .font(.caption.bold()).foregroundStyle(ink)
+                        .padding(.horizontal, 8).padding(.vertical, 5).background(mint)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .position(x: min(max(box.midX, 90), max(90, geometry.size.width - 90)),
+                                  y: max(15, box.minY - 15))
+                }
+            }
+        }.allowsHitTesting(false).accessibilityHidden(true)
+    }
 }
 
 private struct ShareSheet: UIViewControllerRepresentable {

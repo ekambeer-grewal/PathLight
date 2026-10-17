@@ -2,7 +2,7 @@ import AVFoundation
 import Combine
 
 /// Main-thread audio scheduler. Stale sensor data never keeps a proximity tone alive.
-final class AudioGuide: NSObject, ObservableObject {
+final class AudioGuide: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     @Published var route = "Audio not started"
     @Published var stereoAvailable = false
     @Published var error: String?
@@ -10,15 +10,21 @@ final class AudioGuide: NSObject, ObservableObject {
     private let speech = AVSpeechSynthesizer()
     private var player: AVAudioPlayer?
     private var timer: Timer?
-    private var obstacles: [Obstacle] = []
+    private var target: Obstacle?
+    private var announcementID: Int?
+    private var speechGate = DetectionSpeechGate()
     private var updatedAt = Date.distantPast
     private var lastBeep = Date.distantPast
-    private var lastSpoken = Date.distantPast
-    private var lastPhrase = ""
-    private var sideIndex = 0
+    private var detectionUtterance: AVSpeechUtterance?
     private var testingUntil = Date.distantPast
 
+    override init() {
+        super.init()
+        speech.delegate = self
+    }
+
     func start() {
+        speechGate = DetectionSpeechGate()
         do {
             let audio = AVAudioSession.sharedInstance()
             try audio.setCategory(.playback, mode: .default, options: [.mixWithOthers])
@@ -44,16 +50,19 @@ final class AudioGuide: NSObject, ObservableObject {
         stereoAvailable = outputs.contains { $0.portType == .bluetoothA2DP || $0.portType == .headphones }
     }
 
-    func update(_ found: [Obstacle]) { obstacles = found; updatedAt = Date() }
+    func update(_ found: Obstacle?, announcementID: Int) {
+        target = found
+        self.announcementID = announcementID
+        updatedAt = Date()
+    }
 
     func clear() {
-        obstacles = []
+        target = nil
         updatedAt = .distantPast
         player?.stop()
         speech.stopSpeaking(at: .immediate)
         testingUntil = .distantPast
-        lastSpoken = .distantPast
-        lastPhrase = ""
+        // A brief tracking interruption must not bypass the four-second speech cooldown.
     }
 
     func stop() {
@@ -92,21 +101,34 @@ final class AudioGuide: NSObject, ObservableObject {
         let now = Date()
         guard !muted, now > testingUntil,
               now.timeIntervalSince(updatedAt) < 0.85,
-              let nearest = obstacles.first else { return }
-        // Alternate occupied sectors so a persistent left obstacle cannot hide a right one.
-        let sectors = Side.allCases.compactMap { side in obstacles.first { $0.side == side } }
+              let nearest = target else { return }
         let interval = min(1.4, max(0.16, 0.16 + (nearest.distance - 0.35) * 0.34))
-        if now.timeIntervalSince(lastBeep) >= interval, !sectors.isEmpty {
-            beep(sectors[sideIndex % sectors.count].side)
-            sideIndex += 1
+        if now.timeIntervalSince(lastBeep) >= interval {
+            beep(nearest.side)
             lastBeep = now
         }
-        let phrase = nearest.phrase
-        let delay = phrase == lastPhrase ? 7.0 : 3.5
-        if now.timeIntervalSince(lastSpoken) > delay, !speech.isSpeaking {
-            say(phrase)
-            lastPhrase = phrase
-            lastSpoken = now
+        if let id = announcementID,
+           speechGate.consume(id: id, time: now.timeIntervalSinceReferenceDate, speechBusy: speech.isSpeaking) {
+            let utterance = AVSpeechUtterance(string: nearest.phrase)
+            utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+            utterance.rate = 0.48
+            detectionUtterance = utterance
+            speech.speak(utterance)
+        }
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        detectionEnded(utterance)
+    }
+
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        detectionEnded(utterance)
+    }
+
+    private func detectionEnded(_ utterance: AVSpeechUtterance) {
+        if utterance === detectionUtterance {
+            speechGate.ended(at: Date().timeIntervalSinceReferenceDate)
+            detectionUtterance = nil
         }
     }
 }

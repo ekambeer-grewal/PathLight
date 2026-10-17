@@ -14,6 +14,7 @@
 		99B853AC66E143A57D05027D /* ReportWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D5329B8F6CC53E2D49C2213 /* ReportWriter.swift */; };
 		B56CFAB7F2C85714AA704D50 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43B04DF5BB9F867EFA419745 /* Models.swift */; };
 		B817384353764A7EECC9E531 /* beep.wav in Resources */ = {isa = PBXBuildFile; fileRef = 38D8FE5C3796E1B93CEB59DC /* beep.wav */; };
+		D1AA783E3083F788002287E0 /* TrackingLogic.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1AA783D3083F72E002287E0 /* TrackingLogic.swift */; };
 		E35AF223385243593B74575A /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA2328F724550D67ADD52ADC /* AppModel.swift */; };
 		FF82ED1F5C4C9814AD9A635A /* PathLightApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76B2A32EADDE7D1E7B3C9FC6 /* PathLightApp.swift */; };
 /* End PBXBuildFile section */
@@ -39,6 +40,7 @@
 		76B2A32EADDE7D1E7B3C9FC6 /* PathLightApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PathLightApp.swift; sourceTree = "<group>"; };
 		B0F6D44CBC666BD5C641509A /* AudioGuide.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioGuide.swift; sourceTree = "<group>"; };
 		BA2328F724550D67ADD52ADC /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		D1AA783D3083F72E002287E0 /* TrackingLogic.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrackingLogic.swift; sourceTree = "<group>"; };
 		D54C1DA871DACCCE30E5A097 /* PathLightTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PathLightTests.swift; sourceTree = "<group>"; };
 		DB8F25D593A1AEA0A99869F6 /* SceneScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneScanner.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -64,6 +66,7 @@
 		3C3B0F03DC089F93B8457928 /* PathLight */ = {
 			isa = PBXGroup;
 			children = (
+				D1AA783D3083F72E002287E0 /* TrackingLogic.swift */,
 				BA2328F724550D67ADD52ADC /* AppModel.swift */,
 				B0F6D44CBC666BD5C641509A /* AudioGuide.swift */,
 				40C9C23057E73937973CAD16 /* ContentView.swift */,
@@ -216,6 +219,7 @@
 				FF82ED1F5C4C9814AD9A635A /* PathLightApp.swift in Sources */,
 				99B853AC66E143A57D05027D /* ReportWriter.swift in Sources */,
 				6CEA1F8C46F28E3F23104D5C /* SceneScanner.swift in Sources */,
+				D1AA783E3083F788002287E0 /* TrackingLogic.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

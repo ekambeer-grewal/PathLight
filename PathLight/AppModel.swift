@@ -14,6 +14,9 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
     @Published var status = "Ready when you are"
     @Published var obstacles: [Obstacle] = []
     @Published var speed: Double?
+    @Published var speedNote = "Waiting for tracking"
+    @Published var detectionCooldown = 0
+    var previewSize = CGSize(width: 390, height: 220)
     @Published var saved = SavedState()
     @Published var recording: WalkKind?
     @Published var remaining = 0
@@ -29,11 +32,21 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
     private var controlTimer: Timer?
     private var lastFrame = Date.distantPast
     private var lastScan = 0.0
+    private var lastSelectionFrameTime = -Double.infinity
     private var latestRotation = 0.0
+    private var latestTurnRate = 0.0
+    private var lastSpeedTime = -Double.infinity
+    private var poseTracker = PoseSpeedTracker()
+    private var selector = TargetSelector()
+    private let scanQueue = DispatchQueue(label: "PathLight.scene-scanning", qos: .userInitiated)
+    private var scanInFlight = false
+    private var scanEpoch = 0
+    private var navigationReady = false
+    private var lastTrackingNotice = Date.distantPast
+    private var countdownDeadline: Double?
     private var positionIntervalHadTurn = false
     private var mountUpright = true
     private var lastMotionTime = Date.distantPast
-    private var previousPosition: (SIMD3<Float>, Double)?
     private var pendingKind: WalkKind?
     private var recordStart: Double?
     private var samples: [WalkSample] = []
@@ -114,13 +127,19 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
         status = "Move gently to initialize tracking"
         lastFrame = Date()
         lastScan = 0
-        previousPosition = nil
+        lastSelectionFrameTime = -.infinity
+        poseTracker.resetContinuity()
         positionIntervalHadTurn = false
+        selector = TargetSelector()
+        scanEpoch += 1
+        speed = nil
+        lastSpeedTime = -.infinity
+        speedNote = "Waiting for tracking"
         audio.start()
         audio.say("Prototype started. Scan slowly. This does not detect stairs or drop offs.")
         startMotion()
         controlTimer?.invalidate()
-        controlTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.clockTick() }
+        controlTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.clockTick() }
     }
 
     private func startMotion() {
@@ -138,16 +157,19 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
                 return
             }
             self.lastMotionTime = Date()
-            self.motionReady = true
+            if !self.motionReady { self.motionReady = true }
             self.mountUpright = -value.gravity.y > 0.75
             let r = value.rotationRate
             self.latestRotation = sqrt(r.x * r.x + r.y * r.y + r.z * r.z)
-            if self.latestRotation >= 0.8 { self.positionIntervalHadTurn = true }
+            // Turning about gravity is different from ordinary chest bobbing/pitch/roll.
+            let g = value.gravity
+            self.latestTurnRate = abs(r.x * g.x + r.y * g.y + r.z * g.z)
+            if self.latestTurnRate >= 1.2 { self.positionIntervalHadTurn = true }
             guard let start = self.recordStart, self.trackingReady else { return }
             let a = value.userAcceleration
             let tilt = acos(min(1, max(-1, -value.gravity.y))) * 180 / .pi
             let t = value.timestamp - start
-            guard t >= 0, t <= 30, self.latestRotation < 0.8 else { return }
+            guard t >= 0, t <= (self.recording?.duration ?? 0), self.latestTurnRate < 1.2 else { return }
             self.motionSamples.append(MotionSample(time: t, rotation: self.latestRotation,
                 acceleration: sqrt(a.x * a.x + a.y * a.y + a.z * a.z) * 9.80665, tilt: tilt))
         }
@@ -168,65 +190,110 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
         motionReady = false
         obstacles = []
         speed = nil
-        previousPosition = nil
+        poseTracker.resetContinuity()
+        speedNote = "Waiting for tracking"
+        scanEpoch += 1
+        navigationReady = false
+        selector.suspend()
         status = reason
+    }
+
+    private func clearNavigation() {
+        navigationReady = false
+        scanEpoch += 1
+        selector.suspend()
+        obstacles = []
+        audio.clear()
+    }
+
+    private func trackingNotice(_ text: String) {
+        guard Date().timeIntervalSince(lastTrackingNotice) >= 6 else { return }
+        audio.say(text)
+        lastTrackingNotice = Date()
+    }
+
+    private func holdSpeed(_ reason: String) {
+        // A clearly labeled last reading is allowed for at most one second, never recorded.
+        if ProcessInfo.processInfo.systemUptime - lastSpeedTime <= 1, speed != nil {
+            speedNote = "Reacquiring — last reading"
+        } else {
+            speed = nil
+            speedNote = reason
+        }
     }
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         guard running else { return }
         lastFrame = Date()
         if motionReady && !mountUpright {
-            if trackingReady { audio.clear(); audio.say("Mount the phone upright in portrait.") }
+            if trackingReady { clearNavigation(); trackingNotice("Mount the phone upright in portrait.") }
             trackingReady = false
             status = "Mount phone upright in portrait"
-            obstacles = []
-            speed = nil
-            previousPosition = nil
+            poseTracker.resetContinuity()
+            holdSpeed("Mount phone upright")
             return
         }
-        guard case .normal = frame.camera.trackingState, frame.sceneDepth != nil else {
-            if trackingReady { audio.clear(); audio.say("Tracking limited. Pause and scan slowly.") }
+        guard case .normal = frame.camera.trackingState else {
+            if trackingReady { clearNavigation(); trackingNotice("Tracking limited. Pause and scan slowly.") }
             trackingReady = false
             status = "Tracking limited — measurements paused"
-            obstacles = []
-            speed = nil
-            previousPosition = nil
+            poseTracker.resetContinuity()
+            holdSpeed("Waiting for position tracking")
             return
         }
-        trackingReady = true
-        status = recording == nil ? "Live · camera + LiDAR" : "Recording a walking sample"
+        // Pose speed remains available even when a LiDAR depth frame is missing.
+        if !trackingReady { trackingReady = true }
         updatePosition(frame)
-        guard frame.timestamp - lastScan >= 0.25 else { return }
+        let liveStatus = recording == nil ? "Live · walking tracking" : "Recording a walking sample"
+        if status != liveStatus { status = liveStatus }
+        guard frame.sceneDepth != nil else {
+            if navigationReady { clearNavigation() }
+            status = "Walking tracking live · waiting for LiDAR"
+            return
+        }
+        navigationReady = true
+        guard frame.timestamp - lastScan >= 0.35, !scanInFlight else { return }
         lastScan = frame.timestamp
-        obstacles = SceneScanner.scan(frame)
-        if navigationAudio { audio.update(obstacles) }
+        scanInFlight = true
+        let epoch = scanEpoch
+        let viewport = previewSize
+        scanQueue.async { [weak self] in
+            let candidates = SceneScanner.scan(frame, viewport: viewport)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.scanInFlight = false
+                guard self.running, self.navigationReady, self.scanEpoch == epoch,
+                      self.previewSize == viewport,
+                      let newest = self.session.currentFrame,
+                      newest.timestamp - frame.timestamp < 0.75 else { return }
+                let target = self.selector.update(candidates, time: ProcessInfo.processInfo.systemUptime)
+                self.lastSelectionFrameTime = frame.timestamp
+                self.obstacles = target.map { [$0] } ?? []
+                if self.navigationAudio {
+                    self.audio.update(target, announcementID: self.selector.announcementID)
+                }
+            }
+        }
     }
 
     private func updatePosition(_ frame: ARFrame) {
         let p = frame.camera.transform.columns.3
-        let position = SIMD3<Float>(p.x, 0, p.z)
-        let time = frame.timestamp
-        guard let previous = previousPosition else {
-            previousPosition = (position, time)
-            positionIntervalHadTurn = false
+        guard let measurement = poseTracker.update(position: SIMD3<Float>(p.x, p.y, p.z), time: frame.timestamp) else {
+            if !poseTracker.isFresh(at: frame.timestamp) { holdSpeed("Acquiring speed") }
             return
         }
-        let dt = time - previous.1
-        guard dt >= 0.5 else { return }
-        previousPosition = (position, time)
+        speed = measurement.displaySpeed
+        lastSpeedTime = ProcessInfo.processInfo.systemUptime
+        speedNote = "Live · smoothed estimate"
         let hadTurn = positionIntervalHadTurn
         positionIntervalHadTurn = false
-        let velocity = Double(simd_distance(position, previous.0)) / dt
-        guard dt <= 0.8, velocity.isFinite, velocity < 3,
-              !hadTurn, latestRotation < 0.8, Date().timeIntervalSince(lastMotionTime) < 0.3 else {
-            speed = nil
-            return
-        }
-        // This deadband reduces stationary tracking jitter; it also hides very slow movement.
-        let measured = velocity < 0.05 ? 0 : velocity
-        speed = measured
-        if let start = recordStart, previous.1 >= start, time - start <= 30 {
-            samples.append(WalkSample(time: time - start, interval: dt, speed: measured))
+        // Live display is independent of gyro filtering. Reports still exclude rapid turns and missing motion.
+        if let start = recordStart, let kind = recording,
+           measurement.startTime >= start, measurement.endTime - start <= kind.duration,
+           !hadTurn, motionReady, latestTurnRate < 1.2,
+           Date().timeIntervalSince(lastMotionTime) < 0.5 {
+            samples.append(WalkSample(time: measurement.endTime - start,
+                interval: measurement.interval, speed: measurement.rawSpeed))
         }
     }
 
@@ -239,49 +306,64 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
             message = "Record a usable baseline first."
             return
         }
+        if kind == .assessment && (saved.baseline?.algorithmVersion ?? 1) < 2 {
+            message = "Speed tracking has been updated. Record a new five-second baseline before a comparison walk."
+            return
+        }
         pendingKind = kind
+        countdownDeadline = ProcessInfo.processInfo.systemUptime + 5
         countdown = 5
-        remaining = 30
-        audio.say("Walk begins in five seconds. Use the same clear, level route and harness position.", interrupt: true)
+        remaining = Int(kind.duration)
+        audio.say("Start walking at your usual pace. Recording starts in five seconds.", interrupt: true)
     }
 
     private func clockTick() {
         guard running else { return }
-        if Date().timeIntervalSince(lastFrame) > 1.2 {
+        let now = ProcessInfo.processInfo.systemUptime
+        let cooldown = max(0, Int(ceil(selector.nextSelectionTime.isFinite ? selector.nextSelectionTime - now : 0)))
+        if detectionCooldown != cooldown { detectionCooldown = cooldown }
+        if Date().timeIntervalSince(lastFrame) > 0.8 {
+            if trackingReady || navigationReady { clearNavigation() }
             trackingReady = false
-            obstacles = []
-            speed = nil
-            previousPosition = nil
-            audio.clear()
+            poseTracker.resetContinuity()
+            holdSpeed("Waiting for camera frames")
             status = "No fresh camera frames — pause walking"
         }
-        if Date().timeIntervalSince(lastMotionTime) > 0.5 { motionReady = false }
-        if let kind = pendingKind {
+        if now - lastSpeedTime > 1, speed != nil { speed = nil; speedNote = "Acquiring speed" }
+        // Expire the visible box as well as audio if background scanning falls behind.
+        if let frame = session.currentFrame, frame.timestamp - lastSelectionFrameTime > 0.85 { obstacles = [] }
+        if Date().timeIntervalSince(lastMotionTime) > 0.5, motionReady { motionReady = false }
+        if let kind = pendingKind, let deadline = countdownDeadline {
             guard trackingReady, motionReady else {
                 cancelWalk()
                 message = "Countdown canceled because sensor tracking was lost. Try again."
                 return
             }
-            countdown -= 1
-            if countdown == 0 {
+            let seconds = max(0, Int(ceil(deadline - now)))
+            if countdown != seconds { countdown = seconds }
+            if now >= deadline {
                 pendingKind = nil
+                countdownDeadline = nil
                 recording = kind
                 samples = []
                 motionSamples = []
-                previousPosition = nil
-                recordStart = ProcessInfo.processInfo.systemUptime
-                audio.say("Start walking.", interrupt: true)
+                poseTracker.resetContinuity()
+                positionIntervalHadTurn = false
+                recordStart = now
+                audio.say("Recording for \(Int(kind.duration)) seconds.", interrupt: true)
             }
         }
-        if let start = recordStart {
-            remaining = max(0, Int(ceil(30 - (ProcessInfo.processInfo.systemUptime - start))))
-            if remaining == 0 { finishWalk() }
+        if let start = recordStart, let kind = recording {
+            let seconds = max(0, Int(ceil(kind.duration - (now - start))))
+            if remaining != seconds { remaining = seconds }
+            if now - start >= kind.duration { finishWalk() }
         }
     }
 
     func cancelWalk() {
         recording = nil
         pendingKind = nil
+        countdownDeadline = nil
         recordStart = nil
         countdown = 0
         remaining = 0
@@ -292,10 +374,10 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
 
     private func finishWalk() {
         guard let kind = recording else { return }
-        let record = WalkRecord(id: UUID(), date: Date(), kind: kind, duration: 30,
+        let record = WalkRecord(id: UUID(), date: Date(), kind: kind, duration: kind.duration,
             samples: samples, motion: motionSamples,
             baselineID: kind == .assessment ? saved.baseline?.id : nil,
-            device: "\(UIDevice.current.model); iOS \(UIDevice.current.systemVersion)", notes: sessionNotes)
+            device: "\(UIDevice.current.model); iOS \(UIDevice.current.systemVersion)", notes: sessionNotes, algorithmVersion: 2)
         recording = nil
         recordStart = nil
         remaining = 0
