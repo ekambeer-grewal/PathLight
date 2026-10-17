@@ -11,12 +11,24 @@ enum Side: String, Codable, CaseIterable {
 struct Obstacle: Identifiable {
     var name: String
     var side: Side
-    var distance: Double
+    var distance: Double?
     var bounds: CGRect = .zero
     var worldPosition: SIMD3<Float> = .zero
+    var hasWorldPosition = true
+    var source = "ARKit"
+    var confidence: Double? = nil
+    // Capture timestamps, not callback timestamps: repeated UI refreshes cannot revive old data.
+    var observedAt = 0.0
+    var bearing = 0.0
+    var forwardDistance = 0.0
+    var lateralDistance = 0.0
+    var range: Double { distance ?? .infinity }
+    var distanceText: String { distance.map { String(format: "%.1f m", $0) } ?? "Distance unavailable" }
     var id: String { name + side.rawValue }
     var phrase: String {
-        "\(name), \(String(format: "%.1f", distance)) meters, \(side == .center ? "ahead" : "on your " + side.rawValue)"
+        let direction = side == .center ? "ahead" : "on your " + side.rawValue
+        if let distance = distance { return "\(name) \(direction), \(String(format: "%.1f", distance)) meters" }
+        return "\(name), \(direction). Distance unavailable."
     }
 }
 

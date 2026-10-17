@@ -15,6 +15,10 @@
 		B56CFAB7F2C85714AA704D50 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43B04DF5BB9F867EFA419745 /* Models.swift */; };
 		B817384353764A7EECC9E531 /* beep.wav in Resources */ = {isa = PBXBuildFile; fileRef = 38D8FE5C3796E1B93CEB59DC /* beep.wav */; };
 		D1AA783E3083F788002287E0 /* TrackingLogic.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1AA783D3083F72E002287E0 /* TrackingLogic.swift */; };
+		D1AA784030841AA2002287E0 /* YOLODetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1AA783F30841A99002287E0 /* YOLODetector.swift */; };
+		D1AA784230841ACA002287E0 /* DepthSampler.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1AA784130841AC7002287E0 /* DepthSampler.swift */; };
+		D1AA784430841B1C002287E0 /* yolo11n.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = D1AA784330841B1C002287E0 /* yolo11n.mlpackage */; };
+		D1AA784630841B66002287E0 /* yolo11n-labels.json in Resources */ = {isa = PBXBuildFile; fileRef = D1AA784530841B66002287E0 /* yolo11n-labels.json */; };
 		E35AF223385243593B74575A /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA2328F724550D67ADD52ADC /* AppModel.swift */; };
 		FF82ED1F5C4C9814AD9A635A /* PathLightApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76B2A32EADDE7D1E7B3C9FC6 /* PathLightApp.swift */; };
 /* End PBXBuildFile section */
@@ -41,6 +45,12 @@
 		B0F6D44CBC666BD5C641509A /* AudioGuide.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioGuide.swift; sourceTree = "<group>"; };
 		BA2328F724550D67ADD52ADC /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		D1AA783D3083F72E002287E0 /* TrackingLogic.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrackingLogic.swift; sourceTree = "<group>"; };
+		D1AA783F30841A99002287E0 /* YOLODetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YOLODetector.swift; sourceTree = "<group>"; };
+		D1AA784130841AC7002287E0 /* DepthSampler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DepthSampler.swift; sourceTree = "<group>"; };
+		D1AA784330841B1C002287E0 /* yolo11n.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = yolo11n.mlpackage; sourceTree = "<group>"; };
+		D1AA784530841B66002287E0 /* yolo11n-labels.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "yolo11n-labels.json"; sourceTree = "<group>"; };
+		D1AA784730841BA8002287E0 /* Ultralytics-AGPL-3.0.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "Ultralytics-AGPL-3.0.txt"; sourceTree = "<group>"; };
+		D1AA784830841BA8002287E0 /* YOLO11n-provenance.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "YOLO11n-provenance.json"; sourceTree = "<group>"; };
 		D54C1DA871DACCCE30E5A097 /* PathLightTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PathLightTests.swift; sourceTree = "<group>"; };
 		DB8F25D593A1AEA0A99869F6 /* SceneScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneScanner.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -66,6 +76,10 @@
 		3C3B0F03DC089F93B8457928 /* PathLight */ = {
 			isa = PBXGroup;
 			children = (
+				D1AA784530841B66002287E0 /* yolo11n-labels.json */,
+				D1AA784130841AC7002287E0 /* DepthSampler.swift */,
+				D1AA784330841B1C002287E0 /* yolo11n.mlpackage */,
+				D1AA783F30841A99002287E0 /* YOLODetector.swift */,
 				D1AA783D3083F72E002287E0 /* TrackingLogic.swift */,
 				BA2328F724550D67ADD52ADC /* AppModel.swift */,
 				B0F6D44CBC666BD5C641509A /* AudioGuide.swift */,
@@ -83,10 +97,20 @@
 		B28B7AF69320201D1CF206EB = {
 			isa = PBXGroup;
 			children = (
+				D1AA784930841BA8002287E0 /* ThirdParty */,
 				3C3B0F03DC089F93B8457928 /* PathLight */,
 				E717C295FF9827DFF805D88B /* Tests */,
 				FBDC4F23F93125BBEEAE800C /* Products */,
 			);
+			sourceTree = "<group>";
+		};
+		D1AA784930841BA8002287E0 /* ThirdParty */ = {
+			isa = PBXGroup;
+			children = (
+				D1AA784730841BA8002287E0 /* Ultralytics-AGPL-3.0.txt */,
+				D1AA784830841BA8002287E0 /* YOLO11n-provenance.json */,
+			);
+			path = ThirdParty;
 			sourceTree = "<group>";
 		};
 		E717C295FF9827DFF805D88B /* Tests */ = {
@@ -186,6 +210,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D1AA784630841B66002287E0 /* yolo11n-labels.json in Resources */,
 				B817384353764A7EECC9E531 /* beep.wav in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -213,11 +238,14 @@
 			buildActionMask = 2147483647;
 			files = (
 				E35AF223385243593B74575A /* AppModel.swift in Sources */,
+				D1AA784030841AA2002287E0 /* YOLODetector.swift in Sources */,
 				48A7B3A8855881A620485F68 /* AudioGuide.swift in Sources */,
 				30EE17FD865AE91C242CEB20 /* ContentView.swift in Sources */,
+				D1AA784230841ACA002287E0 /* DepthSampler.swift in Sources */,
 				B56CFAB7F2C85714AA704D50 /* Models.swift in Sources */,
 				FF82ED1F5C4C9814AD9A635A /* PathLightApp.swift in Sources */,
 				99B853AC66E143A57D05027D /* ReportWriter.swift in Sources */,
+				D1AA784430841B1C002287E0 /* yolo11n.mlpackage in Sources */,
 				6CEA1F8C46F28E3F23104D5C /* SceneScanner.swift in Sources */,
 				D1AA783E3083F788002287E0 /* TrackingLogic.swift in Sources */,
 			);

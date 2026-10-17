@@ -62,9 +62,18 @@ struct NavigateView: View {
                         .font(.title3.bold()).frame(maxWidth: .infinity).padding(.vertical, 12)
                 }.buttonStyle(.borderedProminent).tint(model.running ? .orange : mint).foregroundStyle(ink)
                     .disabled(!model.acknowledged)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(model.detectorStatus).font(.headline)
+                    if let milliseconds = model.inferenceMilliseconds {
+                        Text(String(format: "Last model + ranging pass: %.0f ms", milliseconds))
+                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    }
+                    Text("Chairs and tables: YOLO11n. Walls ahead: ARKit + LiDAR. Side walls outside the walking corridor are ignored.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }.card()
                 VStack(alignment: .leading, spacing: 14) {
-                    Text("SELECTED SURFACE").font(.caption.bold()).foregroundStyle(mint)
-                    Text(model.detectionCooldown > 0 ? "One target · next selection in \(model.detectionCooldown)s" : "Looking for one nearby target")
+                    Text("SELECTED OBJECT").font(.caption.bold()).foregroundStyle(mint)
+                    Text("One stable target · spoken direction first · closer hazards can interrupt")
                         .font(.footnote).foregroundStyle(.secondary)
                     if model.obstacles.isEmpty {
                         Text(model.running ? "No reliable reading right now" : "Start scanning to see nearby surfaces").font(.title3)
@@ -76,14 +85,15 @@ struct NavigateView: View {
                                     .font(.title2).foregroundStyle(mint).frame(width: 30).accessibilityHidden(true)
                                 VStack(alignment: .leading) {
                                     Text(obstacle.name).font(.title3.bold())
+                                    Text(obstacle.source).font(.caption).foregroundStyle(.secondary)
                                     Text(obstacle.side == .center ? "Ahead" : obstacle.side.rawValue.capitalized).foregroundStyle(.secondary)
                                 }
                                 Spacer()
-                                Text(String(format: "%.1f m", obstacle.distance)).font(.title2.monospacedDigit().bold())
+                                Text(obstacle.distanceText).font(.title2.monospacedDigit().bold())
                             }.accessibilityElement(children: .ignore).accessibilityLabel(obstacle.phrase)
                         }
                     }
-                    Text("The box marks an approximate detected surface region. Distance is from the camera, not body clearance.").font(.footnote).foregroundStyle(.secondary)
+                    Text("Alerts focus on chairs, tables, and walls in the walking corridor, up to about 4.5 m with reliable depth. Wall boxes mark surface regions. Detection distance is not guaranteed.").font(.footnote).foregroundStyle(.secondary)
                 }.card()
                 VStack(alignment: .leading, spacing: 14) {
                     HStack {
@@ -96,7 +106,7 @@ struct NavigateView: View {
                         Text("Connect both AirPods for left/right cues. Speaker audio cannot provide reliable directional cues.").foregroundStyle(.orange)
                     }
                     if let error = audio.error { Text(error).foregroundStyle(.orange) }
-                    Toggle("Speak and beep nearby surfaces", isOn: $model.navigationAudio)
+                    Toggle("Speak and beep selected objects", isOn: $model.navigationAudio)
                         .onChange(of: model.navigationAudio) { enabled in if !enabled { audio.clear() } }
                     HStack {
                         Button("Test left") { audio.test(.left) }
@@ -272,7 +282,7 @@ private struct TargetOverlay: View {
                                  height: target.bounds.height * geometry.size.height)
                 ZStack(alignment: .topLeading) {
                     Path { $0.addRect(box) }.stroke(mint, lineWidth: 3)
-                    Text("\(target.name) · \(String(format: "%.1f m", target.distance))")
+                    Text("\(target.name) · \(target.side == .center ? "Ahead" : target.side.rawValue.capitalized) · \(target.distanceText)")
                         .font(.caption.bold()).foregroundStyle(ink)
                         .padding(.horizontal, 8).padding(.vertical, 5).background(mint)
                         .clipShape(RoundedRectangle(cornerRadius: 6))

@@ -15,7 +15,9 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
     @Published var obstacles: [Obstacle] = []
     @Published var speed: Double?
     @Published var speedNote = "Waiting for tracking"
-    @Published var detectionCooldown = 0
+    @Published var detectorStatus = "Loading YOLO11n…"
+    @Published var detectorReady = false
+    @Published var inferenceMilliseconds: Double?
     var previewSize = CGSize(width: 390, height: 220)
     @Published var saved = SavedState()
     @Published var recording: WalkKind?
@@ -32,13 +34,20 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
     private var controlTimer: Timer?
     private var lastFrame = Date.distantPast
     private var lastScan = 0.0
-    private var lastSelectionFrameTime = -Double.infinity
     private var latestRotation = 0.0
     private var latestTurnRate = 0.0
     private var lastSpeedTime = -Double.infinity
     private var poseTracker = PoseSpeedTracker()
     private var selector = TargetSelector()
     private let scanQueue = DispatchQueue(label: "PathLight.scene-scanning", qos: .userInitiated)
+    private let detector = YOLODetector()
+    private let wallQueue = DispatchQueue(label: "PathLight.walls", qos: .utility)
+    private var wallInFlight = false
+    private var lastWall = 0.0
+    private var yoloTargets: [Obstacle] = []
+    private var wallTargets: [Obstacle] = []
+    private var yoloTime = -Double.infinity
+    private var wallTime = -Double.infinity
     private var scanInFlight = false
     private var scanEpoch = 0
     private var navigationReady = false
@@ -66,6 +75,18 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
                 saved = try JSONDecoder().decode(SavedState.self, from: Data(contentsOf: storeURL))
             }
         } catch { message = "Saved walks could not be loaded: \(error.localizedDescription)" }
+        scanQueue.async { [weak self] in
+            guard let self = self else { return }
+            do {
+                try self.detector.load()
+                DispatchQueue.main.async {
+                    self.detectorReady = true
+                    self.detectorStatus = "YOLO11n ready · on-device"
+                }
+            } catch {
+                DispatchQueue.main.async { self.detectorStatus = "YOLO unavailable: \(error.localizedDescription)" }
+            }
+        }
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.audio.refreshRoute()
@@ -84,8 +105,7 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
     func start() {
         guard !running, !starting, acknowledged else { return }
         guard ARWorldTrackingConfiguration.isSupported,
-              ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth),
-              ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) else {
+              ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) else {
             message = "Live scanning requires a LiDAR iPhone or iPad. Use your iPhone 15 Pro Max; the Simulator cannot run these sensors."
             return
         }
@@ -117,9 +137,11 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
     private func beginSession() {
         let configuration = ARWorldTrackingConfiguration()
         configuration.frameSemantics = [.sceneDepth]
-        configuration.sceneReconstruction = .meshWithClassification
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
+            configuration.sceneReconstruction = .meshWithClassification
+            configuration.planeDetection = [.horizontal, .vertical]
+        }
         configuration.worldAlignment = .gravity
-        configuration.planeDetection = [.horizontal, .vertical]
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
         UIApplication.shared.isIdleTimerDisabled = true
         running = true
@@ -127,7 +149,8 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
         status = "Move gently to initialize tracking"
         lastFrame = Date()
         lastScan = 0
-        lastSelectionFrameTime = -.infinity
+        lastWall = 0
+        resetCandidates()
         poseTracker.resetContinuity()
         positionIntervalHadTurn = false
         selector = TargetSelector()
@@ -136,7 +159,7 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
         lastSpeedTime = -.infinity
         speedNote = "Waiting for tracking"
         audio.start()
-        audio.say("Prototype started. Scan slowly. This does not detect stairs or drop offs.")
+        audio.say("Started.")
         startMotion()
         controlTimer?.invalidate()
         controlTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.clockTick() }
@@ -194,13 +217,20 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
         speedNote = "Waiting for tracking"
         scanEpoch += 1
         navigationReady = false
+        resetCandidates()
         selector.suspend()
         status = reason
+    }
+
+    private func resetCandidates() {
+        yoloTargets = []; wallTargets = []
+        yoloTime = -.infinity; wallTime = -.infinity
     }
 
     private func clearNavigation() {
         navigationReady = false
         scanEpoch += 1
+        resetCandidates()
         selector.suspend()
         obstacles = []
         audio.clear()
@@ -246,34 +276,75 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
         updatePosition(frame)
         let liveStatus = recording == nil ? "Live · walking tracking" : "Recording a walking sample"
         if status != liveStatus { status = liveStatus }
-        guard frame.sceneDepth != nil else {
-            if navigationReady { clearNavigation() }
-            status = "Walking tracking live · waiting for LiDAR"
-            return
-        }
         navigationReady = true
-        guard frame.timestamp - lastScan >= 0.35, !scanInFlight else { return }
-        lastScan = frame.timestamp
-        scanInFlight = true
         let epoch = scanEpoch
         let viewport = previewSize
-        scanQueue.async { [weak self] in
-            let candidates = SceneScanner.scan(frame, viewport: viewport)
-            DispatchQueue.main.async {
+        // Each path has at most one frame in flight. Never enqueue a backlog of camera frames.
+        if detectorReady, frame.timestamp - lastScan >= 0.1, !scanInFlight {
+            lastScan = frame.timestamp
+            scanInFlight = true
+            scanQueue.async { [weak self] in
                 guard let self = self else { return }
-                self.scanInFlight = false
-                guard self.running, self.navigationReady, self.scanEpoch == epoch,
-                      self.previewSize == viewport,
-                      let newest = self.session.currentFrame,
-                      newest.timestamp - frame.timestamp < 0.75 else { return }
-                let target = self.selector.update(candidates, time: ProcessInfo.processInfo.systemUptime)
-                self.lastSelectionFrameTime = frame.timestamp
-                self.obstacles = target.map { [$0] } ?? []
-                if self.navigationAudio {
-                    self.audio.update(target, announcementID: self.selector.announcementID)
+                let start = ProcessInfo.processInfo.systemUptime
+                do {
+                    let detections = try self.detector.detect(frame)
+                    let found = DepthSampler.objects(detections, frame: frame, viewport: viewport)
+                    let elapsed = (ProcessInfo.processInfo.systemUptime - start) * 1000
+                    DispatchQueue.main.async {
+                        self.scanInFlight = false
+                        guard self.running, self.scanEpoch == epoch else { return }
+                        self.inferenceMilliseconds = elapsed
+                        guard self.accepts(frame, epoch: epoch, viewport: viewport, maxAge: 0.5) else {
+                            self.detectorStatus = "YOLO11n running late · stale result dropped"
+                            return
+                        }
+                        self.detectorStatus = "YOLO11n live · on-device"
+                        self.yoloTargets = found
+                        self.yoloTime = frame.timestamp
+                        self.refreshSelection()
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self.scanInFlight = false
+                        guard self.running, self.scanEpoch == epoch else { return }
+                        self.detectorStatus = "YOLO error: \(error.localizedDescription)"
+                        self.yoloTargets = []
+                        self.yoloTime = -.infinity
+                        self.refreshSelection()
+                    }
                 }
             }
         }
+        if frame.timestamp - lastWall >= 0.15, !wallInFlight {
+            lastWall = frame.timestamp
+            wallInFlight = true
+            wallQueue.async { [weak self] in
+                let found = WallMeshScanner.scan(frame, viewport: viewport)
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.wallInFlight = false
+                    guard self.accepts(frame, epoch: epoch, viewport: viewport, maxAge: 0.5) else { return }
+                    self.wallTargets = found
+                    self.wallTime = frame.timestamp
+                    self.refreshSelection()
+                }
+            }
+        }
+    }
+
+    private func accepts(_ frame: ARFrame, epoch: Int, viewport: CGSize, maxAge: Double) -> Bool {
+        running && navigationReady && trackingReady && scanEpoch == epoch && previewSize == viewport
+            && ProcessInfo.processInfo.systemUptime - frame.timestamp < maxAge
+    }
+
+    private func refreshSelection() {
+        guard running, navigationReady, trackingReady else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let named = now - yoloTime < 0.6 ? yoloTargets : []
+        let walls = now - wallTime < 0.6 ? wallTargets : []
+        let target = selector.update(named + walls, time: now, walkingSpeed: speed ?? 0)
+        obstacles = target.map { [$0] } ?? []
+        if navigationAudio { audio.update(target, announcementID: selector.announcementID, targetID: selector.targetID) }
     }
 
     private func updatePosition(_ frame: ARFrame) {
@@ -320,8 +391,6 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
     private func clockTick() {
         guard running else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        let cooldown = max(0, Int(ceil(selector.nextSelectionTime.isFinite ? selector.nextSelectionTime - now : 0)))
-        if detectionCooldown != cooldown { detectionCooldown = cooldown }
         if Date().timeIntervalSince(lastFrame) > 0.8 {
             if trackingReady || navigationReady { clearNavigation() }
             trackingReady = false
@@ -330,8 +399,8 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
             status = "No fresh camera frames — pause walking"
         }
         if now - lastSpeedTime > 1, speed != nil { speed = nil; speedNote = "Acquiring speed" }
-        // Expire the visible box as well as audio if background scanning falls behind.
-        if let frame = session.currentFrame, frame.timestamp - lastSelectionFrameTime > 0.85 { obstacles = [] }
+        // Expire each source using capture time, including when inference stalls.
+        refreshSelection()
         if Date().timeIntervalSince(lastMotionTime) > 0.5, motionReady { motionReady = false }
         if let kind = pendingKind, let deadline = countdownDeadline {
             guard trackingReady, motionReady else {
