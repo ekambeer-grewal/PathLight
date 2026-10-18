@@ -21,6 +21,13 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
     var previewSize = CGSize(width: 390, height: 220)
     @Published var saved = SavedState()
     @Published var recording: WalkKind?
+    @Published var elapsed = 0
+    @Published var liveWindow: WalkWindow?
+    @Published var liveEventCount = 0
+    @Published var centerDistance: Double?
+    @Published var distanceUnit = DistanceUnit.current {
+        didSet { UserDefaults.standard.set(distanceUnit.rawValue, forKey: "distance-unit") }
+    }
     @Published var remaining = 0
     @Published var countdown = 0
     @Published var message: String?
@@ -60,6 +67,13 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
     private var recordStart: Double?
     private var samples: [WalkSample] = []
     private var motionSamples: [MotionSample] = []
+    private var motionBucket = MotionBucket()
+    private var analyzer = WalkAnalyzer()
+    private var windows: [WalkWindow] = []
+    private var contexts: [(Double, WalkContext)] = []
+    private var lastAnalysisTime = 0.0
+    private var depthContext = WalkContext()
+    private var recordDate = Date()
     private let storeURL: URL
     private var starting = false
     private var startGeneration = 0
@@ -175,7 +189,8 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
             guard let self = self else { return }
             guard let value = value, error == nil else {
                 self.motionReady = false
-                if self.recording != nil || self.pendingKind != nil { self.cancelWalk() }
+                if self.recording == .assessment { self.finishWalk(endReason: "Motion sensor interruption") }
+                else if self.recording != nil || self.pendingKind != nil { self.cancelWalk() }
                 self.message = "Motion data unavailable. Check Motion & Fitness permission in Settings."
                 return
             }
@@ -187,21 +202,29 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
             // Turning about gravity is different from ordinary chest bobbing/pitch/roll.
             let g = value.gravity
             self.latestTurnRate = abs(r.x * g.x + r.y * g.y + r.z * g.z)
-            if self.latestTurnRate >= 1.2 { self.positionIntervalHadTurn = true }
+            if self.latestTurnRate >= 0.8 { self.positionIntervalHadTurn = true }
             guard let start = self.recordStart, self.trackingReady else { return }
             let a = value.userAcceleration
             let tilt = acos(min(1, max(-1, -value.gravity.y))) * 180 / .pi
             let t = value.timestamp - start
-            guard t >= 0, t <= (self.recording?.duration ?? 0), self.latestTurnRate < 1.2 else { return }
-            self.motionSamples.append(MotionSample(time: t, rotation: self.latestRotation,
-                acceleration: sqrt(a.x * a.x + a.y * a.y + a.z * a.z) * 9.80665, tilt: tilt))
+            guard t >= 0, t <= (self.recording?.duration ?? 0) else { return }
+            if self.recording == .baseline && self.latestTurnRate >= 0.8 {
+                self.motionBucket = MotionBucket()
+                return
+            }
+            if let sample = self.motionBucket.add(time: t, rotation: SIMD3<Double>(r.x, r.y, r.z),
+                acceleration: sqrt(a.x * a.x + a.y * a.y + a.z * a.z) * 9.80665,
+                tilt: tilt, turnRate: self.latestTurnRate) {
+                self.motionSamples.append(sample)
+            }
         }
     }
 
     func stop(reason: String = "Paused") {
         startGeneration += 1
         starting = false
-        if recording != nil || pendingKind != nil { cancelWalk() }
+        if recording == .assessment { finishWalk(endReason: reason) }
+        else if recording != nil || pendingKind != nil { cancelWalk() }
         session.pause()
         motionManager.stopDeviceMotionUpdates()
         controlTimer?.invalidate()
@@ -225,6 +248,8 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
     private func resetCandidates() {
         yoloTargets = []; wallTargets = []
         yoloTime = -.infinity; wallTime = -.infinity
+        depthContext = WalkContext()
+        centerDistance = nil
     }
 
     private func clearNavigation() {
@@ -319,12 +344,14 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
             lastWall = frame.timestamp
             wallInFlight = true
             wallQueue.async { [weak self] in
-                let found = WallMeshScanner.scan(frame, viewport: viewport)
+                let found = IndoorSceneScanner.scan(frame, viewport: viewport)
                 DispatchQueue.main.async {
                     guard let self = self else { return }
                     self.wallInFlight = false
                     guard self.accepts(frame, epoch: epoch, viewport: viewport, maxAge: 0.5) else { return }
-                    self.wallTargets = found
+                    self.wallTargets = found.walls
+                    self.depthContext = found.context
+                    self.centerDistance = found.centerDistance
                     self.wallTime = frame.timestamp
                     self.refreshSelection()
                 }
@@ -358,10 +385,10 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
         speedNote = "Live · smoothed estimate"
         let hadTurn = positionIntervalHadTurn
         positionIntervalHadTurn = false
-        // Live display is independent of gyro filtering. Reports still exclude rapid turns and missing motion.
+        // Preserve turns in continuous sessions so they can be labeled as context, not gait change.
         if let start = recordStart, let kind = recording,
            measurement.startTime >= start, measurement.endTime - start <= kind.duration,
-           !hadTurn, motionReady, latestTurnRate < 1.2,
+           (kind == .assessment || (!hadTurn && latestTurnRate < 0.8)), motionReady,
            Date().timeIntervalSince(lastMotionTime) < 0.5 {
             samples.append(WalkSample(time: measurement.endTime - start,
                 interval: measurement.interval, speed: measurement.rawSpeed))
@@ -377,14 +404,15 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
             message = "Record a usable baseline first."
             return
         }
-        if kind == .assessment && (saved.baseline?.algorithmVersion ?? 1) < 2 {
-            message = "Speed tracking has been updated. Record a new five-second baseline before a comparison walk."
+        if kind == .assessment && (saved.baseline?.algorithmVersion ?? 1) < 3 {
+            message = "Record a new five-second speed + gyroscope baseline for continuous walks."
             return
         }
         pendingKind = kind
         countdownDeadline = ProcessInfo.processInfo.systemUptime + 5
         countdown = 5
-        remaining = Int(kind.duration)
+        remaining = kind == .baseline ? 5 : 0
+        elapsed = 0
         audio.say("Start walking at your usual pace. Recording starts in five seconds.", interrupt: true)
     }
 
@@ -416,17 +444,46 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
                 recording = kind
                 samples = []
                 motionSamples = []
+                motionBucket = MotionBucket()
+                analyzer = WalkAnalyzer()
+                windows = []; contexts = []
+                liveWindow = nil; liveEventCount = 0
+                lastAnalysisTime = 0
+                recordDate = Date()
                 poseTracker.resetContinuity()
                 positionIntervalHadTurn = false
                 recordStart = now
-                audio.say("Recording for \(Int(kind.duration)) seconds.", interrupt: true)
+                audio.say(kind == .baseline ? "Recording baseline." : "Walk started.", interrupt: true)
             }
         }
         if let start = recordStart, let kind = recording {
-            let seconds = max(0, Int(ceil(kind.duration - (now - start))))
-            if remaining != seconds { remaining = seconds }
-            if now - start >= kind.duration { finishWalk() }
+            let time = now - start
+            elapsed = max(0, Int(time))
+            if kind == .baseline {
+                remaining = max(0, Int(ceil(5 - time)))
+                if time >= 5 { finishWalk() }
+            } else if time - lastAnalysisTime >= 1 {
+                updateWalkAnalysis(time: time, now: now)
+            }
         }
+        if now - wallTime > 0.6 { centerDistance = nil }
+    }
+
+    private func updateWalkAnalysis(time: Double, now: Double) {
+        guard let baseline = saved.baseline else { return }
+        var context = now - wallTime <= 0.6 ? depthContext : WalkContext()
+        let named = (yoloTargets + wallTargets).filter {
+            now - $0.observedAt <= 0.6 && abs($0.lateralDistance) <= 0.5 && $0.forwardDistance <= 2.2
+        }.min { $0.range < $1.range }
+        if let named = named { context = WalkContext(state: .detected, name: named.name, distance: named.distance) }
+        contexts.append((time, context))
+        contexts.removeAll { time - $0.0 > 4 }
+        let window = analyzer.evaluate(time: time, baseline: baseline, samples: samples,
+                                       motion: motionSamples, contexts: contexts)
+        windows.append(window)
+        liveWindow = window
+        liveEventCount = analyzer.events.filter { $0.kind == .combinedChange }.count
+        lastAnalysisTime = time
     }
 
     func cancelWalk() {
@@ -436,36 +493,43 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
         recordStart = nil
         countdown = 0
         remaining = 0
-        samples = []
-        motionSamples = []
-        audio.say("Walk canceled. No recording saved.", interrupt: true)
+        elapsed = 0
+        samples = []; motionSamples = []; windows = []; contexts = []
+        motionBucket = MotionBucket()
+        liveWindow = nil
+        audio.say("Walk canceled.", interrupt: true)
     }
 
-    private func finishWalk() {
-        guard let kind = recording else { return }
-        let record = WalkRecord(id: UUID(), date: Date(), kind: kind, duration: kind.duration,
+    func finishWalk(endReason: String = "Ended by user") {
+        guard let kind = recording, let start = recordStart else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let duration = kind == .baseline ? min(5, now - start) : max(0, now - start)
+        if kind == .assessment, duration - lastAnalysisTime >= 0.5 {
+            updateWalkAnalysis(time: duration, now: now)
+        }
+        let record = WalkRecord(id: UUID(), date: recordDate, kind: kind, duration: duration,
             samples: samples, motion: motionSamples,
             baselineID: kind == .assessment ? saved.baseline?.id : nil,
-            device: "\(UIDevice.current.model); iOS \(UIDevice.current.systemVersion)", notes: sessionNotes, algorithmVersion: 2)
+            device: "\(UIDevice.current.model); iOS \(UIDevice.current.systemVersion)", notes: sessionNotes,
+            algorithmVersion: 3, windows: kind == .assessment ? windows : nil,
+            events: kind == .assessment ? analyzer.events : nil, endReason: endReason)
         recording = nil
         recordStart = nil
         remaining = 0
+        samples = []; motionSamples = []; windows = []; contexts = []
         if kind == .baseline {
             guard record.usable else {
                 message = "Baseline not saved. " + record.qualityIssues.joined(separator: " ")
-                audio.say("Baseline quality is insufficient. Please repeat.", interrupt: true)
+                audio.say("Please repeat the baseline.", interrupt: true)
                 return
             }
-            // UI asks before replacing; old assessments must not silently compare with a new baseline.
             saved.baseline = record
             saved.assessments = []
         } else {
             saved.assessments.insert(record, at: 0)
             saved.assessments = Array(saved.assessments.prefix(20))
         }
-        if persist() {
-            audio.say(kind == .baseline ? "Baseline saved." : "Assessment saved. Review your results.", interrupt: true)
-        }
+        if persist() { audio.say(kind == .baseline ? "Baseline saved." : "Walk saved.", interrupt: true) }
     }
 
     @discardableResult private func persist() -> Bool {

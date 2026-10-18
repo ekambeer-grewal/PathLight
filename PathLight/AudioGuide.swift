@@ -47,7 +47,7 @@ final class AudioGuide: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
             error = nil
             refreshRoute()
             if timer == nil {
-                let clock = Timer(timeInterval: 0.04, repeats: true) { [weak self] _ in self?.tick() }
+                let clock = Timer(timeInterval: 0.02, repeats: true) { [weak self] _ in self?.tick() }
                 RunLoop.main.add(clock, forMode: .common) // Keep ticking while the screen scrolls.
                 timer = clock
             }
@@ -72,7 +72,7 @@ final class AudioGuide: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
             urgentPending = false
         } else if changed || target == nil {
             lastBeep = -.infinity
-            urgentPending = (found?.range ?? .infinity) <= 2.5
+            urgentPending = true // A confirmed NEW target is not a repeated description.
         }
         if let found = found, found.range <= 1.2, warnedCloseTargetID != targetID {
             urgentPending = true
@@ -109,7 +109,7 @@ final class AudioGuide: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
         guard !speech.isSpeaking else { return }
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
-        utterance.rate = 0.5
+        utterance.rate = 0.57
         speech.speak(utterance)
     }
 
@@ -149,7 +149,7 @@ final class AudioGuide: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
                               urgent: urgentPending || (nearest.range <= 2.5 && spokenTargetID != targetID)) {
             let utterance = AVSpeechUtterance(string: nearest.phrase)
             utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
-            utterance.rate = 0.52
+            utterance.rate = 0.60
             detectionUtterance = utterance
             spokenTargetID = targetID
             urgentPending = false

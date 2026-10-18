@@ -98,3 +98,77 @@ enum WallMeshScanner {
         return result
     }
 }
+
+struct IndoorSceneResult {
+    var walls: [Obstacle]
+    var context: WalkContext
+    var centerDistance: Double?
+}
+
+/// Detect a vertical wall-like plane directly in current depth, without waiting for a mesh label.
+/// Furniture can also be planar: the UI identifies this fallback as an estimated wall surface.
+enum IndoorSceneScanner {
+    static func scan(_ frame: ARFrame, viewport: CGSize) -> IndoorSceneResult {
+        guard let sampler = DepthSampler(frame: frame, viewport: viewport),
+              let corridor = WalkingCorridor(camera: frame.camera.transform) else {
+            return IndoorSceneResult(walls: [], context: WalkContext(), centerDistance: nil)
+        }
+        let inverse = sampler.imageToView.inverted()
+        var points: [DepthSampler.Reading] = []
+        var center: [Double] = []
+        for row in 0..<17 {
+            for column in 0..<23 {
+                let screen = CGPoint(x: 0.1 + Double(column) * 0.8 / 22,
+                                     y: 0.16 + Double(row) * 0.68 / 16)
+                guard let point = sampler.reading(raw: screen.applying(inverse)) else { continue }
+                if abs(screen.x - 0.5) < 0.06 && abs(screen.y - 0.5) < 0.06 { center.append(point.distance) }
+                let offset = corridor.offset(point.world)
+                if point.relativeHeight > -0.8 && point.relativeHeight < 0.65,
+                   offset.forward >= 0.2 && offset.forward <= 4.5, abs(offset.lateral) < 1.0 {
+                    points.append(point)
+                }
+            }
+        }
+        center.sort()
+        let diagnostic = center.count >= 3 ? center[center.count / 2] : nil
+        let central = points.filter { abs(corridor.offset($0.world).lateral) < 0.45 }
+        let near = central.filter { corridor.offset($0.world).forward < 2.2 }.sorted { $0.distance < $1.distance }
+        var context = WalkContext(state: central.count >= 12 ? .noneDetected : .unavailable)
+        for point in near {
+            let group = near.filter { simd_distance($0.world, point.world) < 0.4 }
+            if group.count >= 6 {
+                context = WalkContext(state: .detected, name: "surface ahead", distance: point.distance)
+                break
+            }
+        }
+        var walls: [Obstacle] = []
+        if points.count >= 24 {
+            let local = points.map { point -> SIMD3<Double> in
+                let offset = corridor.offset(point.world)
+                return SIMD3<Double>(offset.lateral, point.relativeHeight, offset.forward)
+            }
+            let best = WallPlaneFit.inliers(local).map { points[$0] }
+            if !best.isEmpty {
+                let sorted = best.sorted { $0.distance < $1.distance }
+                let reading = sorted[sorted.count / 3]
+                let world = best.reduce(SIMD3<Float>.zero) { $0 + $1.world } / Float(best.count)
+                let offset = corridor.offset(world)
+                let bearing = atan2(offset.lateral, offset.forward) * 180 / .pi
+                let xs = best.map { $0.screen.x }, ys = best.map { $0.screen.y }
+                let bounds = CGRect(x: xs.min() ?? 0, y: ys.min() ?? 0,
+                    width: (xs.max() ?? 1) - (xs.min() ?? 0), height: (ys.max() ?? 1) - (ys.min() ?? 0))
+                walls.append(Obstacle(name: "Wall", side: NavigationPolicy.side(bearing: bearing),
+                    distance: reading.distance, bounds: bounds, worldPosition: world,
+                    source: "LiDAR planar surface · wall estimate", observedAt: frame.timestamp,
+                    bearing: bearing, forwardDistance: offset.forward, lateralDistance: offset.lateral))
+            }
+        }
+        // Semantic labels supplement the depth fit. Avoid duplicate targets for the same surface.
+        for mesh in WallMeshScanner.scan(frame, viewport: viewport) {
+            if let index = walls.firstIndex(where: { simd_distance($0.worldPosition, mesh.worldPosition) < 0.8 }) {
+                walls[index].source = "LiDAR + ARKit wall"
+            } else { walls.append(mesh) }
+        }
+        return IndoorSceneResult(walls: walls, context: context, centerDistance: diagnostic)
+    }
+}

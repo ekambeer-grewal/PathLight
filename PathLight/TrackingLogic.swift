@@ -6,19 +6,30 @@ enum NavigationPolicy {
     static let freshness = 0.65
     static func inPath(forward: Double, lateral: Double, wall: Bool = false) -> Bool {
         forward.isFinite && lateral.isFinite && forward >= 0.2 && forward <= 4.5
-            && abs(lateral) <= (wall ? 0.55 : 0.8)
+            && abs(lateral) <= (wall ? 0.55 : 0.95)
     }
     static func lookAhead(speed: Double) -> Double {
         min(4.5, max(3.5, max(0, speed) * 3 + 0.5))
     }
     static func side(bearing: Double, previous: Side? = nil) -> Side {
         // Hysteresis prevents left/ahead/right chatter near a boundary.
-        if previous == .left && bearing < -6 { return .left }
-        if previous == .right && bearing > 6 { return .right }
-        return bearing < -12 ? .left : bearing > 12 ? .right : .center
+        if previous == .left && bearing < -16 { return .left }
+        if previous == .right && bearing > 16 { return .right }
+        return bearing < -22 ? .left : bearing > 22 ? .right : .center
     }
     static func beepInterval(distance: Double) -> Double {
-        min(1.1, max(0.2, 0.2 + (distance - 0.5) * 0.24))
+        let points: [(Double, Double)] = [(0.35, 0.10), (0.75, 0.14), (1, 0.20),
+            (1.5, 0.34), (2, 0.55), (3, 1.0), (4.5, 1.8)]
+        guard distance.isFinite else { return 1.8 }
+        if distance <= points[0].0 { return points[0].1 }
+        for index in 1..<points.count {
+            let left = points[index - 1], right = points[index]
+            if distance <= right.0 {
+                let progress = (distance - left.0) / (right.0 - left.0)
+                return left.1 + progress * (right.1 - left.1)
+            }
+        }
+        return 1.8
     }
 }
 
@@ -204,5 +215,141 @@ struct PoseSpeedTracker {
     func isFresh(at time: Double) -> Bool {
         guard let accepted = acceptedTime else { return false }
         return time >= accepted && time - accepted < 0.6
+    }
+}
+
+/// Condense 50 Hz motion into 0.2-second RMS buckets without losing rotational energy.
+struct MotionBucket {
+    private var previousTime: Double?
+    private var seconds = 0.0
+    private var squares = SIMD3<Double>.zero
+    private var accelerationSquare = 0.0
+    private var tiltSum = 0.0
+    private var turnMaximum = 0.0
+
+    mutating func add(time: Double, rotation: SIMD3<Double>, acceleration: Double,
+                      tilt: Double, turnRate: Double) -> MotionSample? {
+        guard time.isFinite, rotation.x.isFinite, rotation.y.isFinite, rotation.z.isFinite,
+              acceleration.isFinite, tilt.isFinite, turnRate.isFinite else { self = MotionBucket(); return nil }
+        guard let previous = previousTime else { previousTime = time; return nil }
+        let dt = time - previous
+        previousTime = time
+        guard dt > 0, dt <= 0.1 else { self = MotionBucket(); previousTime = time; return nil }
+        seconds += dt
+        squares += rotation * rotation * dt
+        accelerationSquare += acceleration * acceleration * dt
+        tiltSum += tilt * dt
+        turnMaximum = max(turnMaximum, turnRate)
+        guard seconds >= 0.2 else { return nil }
+        let axes = SIMD3<Double>(sqrt(squares.x / seconds), sqrt(squares.y / seconds), sqrt(squares.z / seconds))
+        let output = MotionSample(time: time, rotation: sqrt((squares.x + squares.y + squares.z) / seconds),
+            acceleration: sqrt(accelerationSquare / seconds), tilt: tiltSum / seconds,
+            interval: seconds, rotationX: axes.x, rotationY: axes.y, rotationZ: axes.z, turnRate: turnMaximum)
+        seconds = 0; squares = .zero; accelerationSquare = 0; tiltSum = 0; turnMaximum = 0
+        return output
+    }
+}
+
+/// Engineering thresholds, not clinical gait classification. All inputs use SI units.
+struct WalkAnalyzer {
+    private(set) var events: [WalkEvent] = []
+    private var pending: WalkState = .steady
+    private var pendingCount = 0
+    private var lastTime = -Double.infinity
+
+    mutating func evaluate(time: Double, baseline: WalkRecord, samples: [WalkSample],
+                           motion: [MotionSample], contexts: [(Double, WalkContext)]) -> WalkWindow {
+        let span = 3.0
+        let start = max(0, time - span)
+        func overlap(end: Double, length: Double) -> Double {
+            max(0, min(time, end) - max(start, end - length))
+        }
+        let position = samples.suffix(24).map { ($0, overlap(end: $0.time, length: $0.interval)) }
+        let gyro = motion.suffix(40).map { ($0, overlap(end: $0.time, length: $0.interval ?? 0.02)) }
+        let pSeconds = position.reduce(0.0) { $0 + $1.1 }
+        let mSeconds = gyro.reduce(0.0) { $0 + $1.1 }
+        let speed = pSeconds > 0 ? position.reduce(0.0) { $0 + $1.0.speed * $1.1 } / pSeconds : nil
+        let rotation = mSeconds > 0 ? sqrt(gyro.reduce(0.0) { $0 + pow($1.0.rotation, 2) * $1.1 } / mSeconds) : nil
+        let keys: [KeyPath<MotionSample, Double?>] = [\.rotationX, \.rotationY, \.rotationZ]
+        let axes = keys.map { key in
+            sqrt(gyro.reduce(0.0) { sum, pair in sum + pow(pair.0[keyPath: key] ?? 0, 2) * pair.1 } / max(mSeconds, 0.001))
+        }
+        let tilt = gyro.reduce(0.0) { $0 + $1.0.tilt * $1.1 } / max(mSeconds, 0.001)
+        let turn = gyro.filter { $0.1 > 0 }.map { $0.0.turnRate ?? 0 }.max() ?? 0
+        let contextValues = contexts.filter { $0.0 >= start && $0.0 <= time }.map { $0.1 }
+        let obstruction = contextValues.last(where: { $0.state == .detected })
+            ?? contextValues.last ?? WalkContext()
+        let speedChanged = speed.map { abs($0 - baseline.meanSpeed) > max(0.15, baseline.meanSpeed * 0.2) } ?? false
+        let baselineAxes = baseline.axisRMS
+        let axisChanged = zip(axes, baselineAxes).contains { abs($0.0 - $0.1) > max(0.1, $0.1 * 0.4) }
+        let gyroChanged = rotation.map { abs($0 - baseline.rotationRMS) > max(0.08, baseline.rotationRMS * 0.3) } ?? false
+        let changedGyro = gyroChanged || axisChanged
+        let pCoverage = min(1, pSeconds / span), mCoverage = min(1, mSeconds / span)
+        var state: WalkState
+        if time < span { state = .warmingUp }
+        else if pCoverage < 0.7 || mCoverage < 0.7 { state = .trackingGap }
+        else if abs(tilt - baseline.meanTilt) > 15 { state = .mountChanged }
+        else if turn >= 0.8 { state = .turning }
+        else if speedChanged && (speed ?? 0) < baseline.meanSpeed && obstruction.state == .detected { state = .obstructionSlowdown }
+        else if (speed ?? 0) < 0.12 { state = .paused }
+        else if speedChanged && changedGyro { state = .combinedChange }
+        else if speedChanged { state = .speedChange }
+        else if changedGyro { state = .gyroChange }
+        else { state = .steady }
+        let needsPersistence: [WalkState] = [.combinedChange, .speedChange, .gyroChange, .obstructionSlowdown]
+        if needsPersistence.contains(state) {
+            pendingCount = pending == state && time - lastTime <= 1.6 ? pendingCount + 1 : 1
+            pending = state
+            if pendingCount < 2 { state = .warmingUp }
+        } else { pending = state; pendingCount = 0 }
+        if state.recordsEvent {
+            if let index = events.indices.last, events[index].kind == state, time - events[index].end <= 1.6 {
+                events[index].end = time
+                events[index].speed = speed
+                events[index].rotation = rotation
+                events[index].gyroAlsoChanged = events[index].gyroAlsoChanged || changedGyro
+            } else {
+                events.append(WalkEvent(start: max(0, lastTime.isFinite ? lastTime : time - 1), end: time, kind: state,
+                    speed: speed, rotation: rotation, obstructionName: obstruction.name, gyroAlsoChanged: changedGyro))
+            }
+        }
+        lastTime = time
+        return WalkWindow(time: time, speed: speed, rotation: rotation, axes: axes,
+            positionCoverage: pCoverage, motionCoverage: mCoverage, obstruction: obstruction.state,
+            obstructionName: obstruction.name, obstructionDistance: obstruction.distance,
+            speedChanged: speedChanged, gyroChanged: changedGyro, state: state)
+    }
+}
+
+/// Points use local coordinates (lateral, height relative to camera, forward), in meters.
+/// A forward-facing plane must span the central path and a substantial vertical extent.
+enum WallPlaneFit {
+    static func inliers(_ points: [SIMD3<Double>]) -> [Int] {
+        guard points.count >= 24 else { return [] }
+        var best: [Int] = []
+        var score = -Double.infinity
+        for index in 0..<96 {
+            let a = points[(index * 17) % points.count]
+            let b = points[(index * 43 + points.count / 2) % points.count]
+            let delta = b - a
+            let length = sqrt(delta.x * delta.x + delta.z * delta.z)
+            guard length > 0.3 else { continue }
+            let nx = delta.z / length, nz = -delta.x / length
+            guard abs(nz) > 0.55 else { continue } // Parallel hallway walls are not ahead.
+            let tolerance = min(0.12, 0.045 + a.z * 0.015)
+            let all = points.indices.filter {
+                abs((points[$0].x - a.x) * nx + (points[$0].z - a.z) * nz) < tolerance
+            }
+            guard all.count >= max(20, points.count / 4) else { continue }
+            let xs = all.map { points[$0].x }, ys = all.map { points[$0].y }
+            guard (xs.min() ?? 0) < -0.18, (xs.max() ?? 0) > 0.18,
+                  (ys.max() ?? 0) - (ys.min() ?? 0) > 0.5 else { continue }
+            let middle = all.filter { abs(points[$0].x) <= 0.55 && points[$0].z >= 0.2 && points[$0].z <= 4.5 }
+            guard middle.count >= 12 else { continue }
+            let depths = middle.map { points[$0].z }.sorted()
+            let candidateScore = Double(middle.count) / max(depths[depths.count / 2], 0.5)
+            if candidateScore > score { score = candidateScore; best = middle }
+        }
+        return best
     }
 }

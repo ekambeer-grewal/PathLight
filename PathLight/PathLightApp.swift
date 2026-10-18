@@ -9,7 +9,7 @@ struct PathLightApp: App {
         WindowGroup {
             ContentView(model: model)
                 .preferredColorScheme(.dark)
-                .onChange(of: scenePhase) { phase in
+                .onChange(of: scenePhase) { _, phase in
                     if phase == .background || (phase != .active && model.running) {
                         model.stop(reason: "Paused while app is inactive")
                     }

@@ -83,15 +83,19 @@ final class DepthSampler {
             for column in 0..<7 {
                 let raw = CGPoint(x: inset.minX + inset.width * CGFloat(column) / 6,
                                   y: inset.minY + inset.height * CGFloat(row) / 6)
-                if let value = reading(raw: raw) { readings.append(value) }
+                if let value = reading(raw: raw), value.relativeHeight > -1.15,
+                   value.relativeHeight < 0.8 { readings.append(value) }
             }
         }
-        guard readings.count >= 6 else { return nil }
+        guard readings.count >= 10 else { return nil }
         readings.sort { $0.distance < $1.distance }
-        let near = readings[readings.count / 5].distance
-        let coherent = readings.filter { abs($0.distance - near) <= max(0.18, near * 0.1) }
-        guard coherent.count >= 4 else { return nil }
-        return coherent[coherent.count / 2]
+        // Require a supported foreground cluster rather than an isolated near pixel.
+        let minimum = max(8, readings.count / 4)
+        for near in readings {
+            let coherent = readings.filter { abs($0.distance - near.distance) <= max(0.10, near.distance * 0.045) }
+            if coherent.count >= minimum { return coherent[coherent.count / 2] }
+        }
+        return nil
     }
 
     static func objects(_ detections: [ImageDetection], frame: ARFrame, viewport: CGSize) -> [Obstacle] {
