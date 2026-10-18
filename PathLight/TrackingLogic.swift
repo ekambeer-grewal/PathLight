@@ -255,11 +255,14 @@ struct WalkAnalyzer {
     private(set) var events: [WalkEvent] = []
     private var pending: WalkState = .steady
     private var pendingCount = 0
+    private var pendingStart = 0.0
+    private var pendingContexts: [String] = []
+    private var activeEventIndex: Int?
     private var lastTime = -Double.infinity
 
     mutating func evaluate(time: Double, baseline: WalkRecord, samples: [WalkSample],
                            motion: [MotionSample], contexts: [(Double, WalkContext)]) -> WalkWindow {
-        let span = 3.0
+        let span = WalkThresholds.windowSeconds
         let start = max(0, time - span)
         func overlap(end: Double, length: Double) -> Double {
             max(0, min(time, end) - max(start, end - length))
@@ -279,40 +282,68 @@ struct WalkAnalyzer {
         let contextValues = contexts.filter { $0.0 >= start && $0.0 <= time }.map { $0.1 }
         let obstruction = contextValues.last(where: { $0.state == .detected })
             ?? contextValues.last ?? WalkContext()
-        let speedChanged = speed.map { abs($0 - baseline.meanSpeed) > max(0.15, baseline.meanSpeed * 0.2) } ?? false
+        let speedChanged = speed.map { abs($0 - baseline.meanSpeed) > WalkThresholds.speed(baseline.meanSpeed) } ?? false
         let baselineAxes = baseline.axisRMS
-        let axisChanged = zip(axes, baselineAxes).contains { abs($0.0 - $0.1) > max(0.1, $0.1 * 0.4) }
-        let gyroChanged = rotation.map { abs($0 - baseline.rotationRMS) > max(0.08, baseline.rotationRMS * 0.3) } ?? false
+        let axisChanged = zip(axes, baselineAxes).contains { abs($0.0 - $0.1) > WalkThresholds.axis($0.1) }
+        let gyroChanged = rotation.map { abs($0 - baseline.rotationRMS) > WalkThresholds.rotation(baseline.rotationRMS) } ?? false
         let changedGyro = gyroChanged || axisChanged
         let pCoverage = min(1, pSeconds / span), mCoverage = min(1, mSeconds / span)
+        var contextLabels: [String] = []
+        if turn >= 0.8 { contextLabels.append("Turning") }
+        if (speed ?? 0) < 0.12 { contextLabels.append("Pause / very slow movement") }
+        if obstruction.state == .detected { contextLabels.append("Nearby obstruction detected") }
+        if obstruction.state == .unavailable { contextLabels.append("Obstruction context unavailable") }
         var state: WalkState
         if time < span { state = .warmingUp }
-        else if pCoverage < 0.7 || mCoverage < 0.7 { state = .trackingGap }
+        else if pCoverage < WalkThresholds.minimumCoverage || mCoverage < WalkThresholds.minimumCoverage { state = .trackingGap }
         else if abs(tilt - baseline.meanTilt) > 15 { state = .mountChanged }
+        // Both changes must occur in the SAME usable window. Context remains attached
+        // to the event; it must not hide a simultaneous threshold crossing.
+        else if speedChanged && changedGyro { state = .combinedChange }
         else if turn >= 0.8 { state = .turning }
         else if speedChanged && (speed ?? 0) < baseline.meanSpeed && obstruction.state == .detected { state = .obstructionSlowdown }
         else if (speed ?? 0) < 0.12 { state = .paused }
-        else if speedChanged && changedGyro { state = .combinedChange }
         else if speedChanged { state = .speedChange }
         else if changedGyro { state = .gyroChange }
         else { state = .steady }
         let needsPersistence: [WalkState] = [.combinedChange, .speedChange, .gyroChange, .obstructionSlowdown]
+        let continuous = time > lastTime && time - lastTime <= WalkThresholds.maximumEvaluationGap
         if needsPersistence.contains(state) {
-            pendingCount = pending == state && time - lastTime <= 1.6 ? pendingCount + 1 : 1
+            if pending == state && continuous {
+                pendingCount += 1
+                pendingContexts = Array(Set(pendingContexts + contextLabels)).sorted()
+            } else {
+                pendingCount = 1
+                pendingStart = time
+                pendingContexts = contextLabels
+                activeEventIndex = nil
+            }
             pending = state
             if pendingCount < 2 { state = .warmingUp }
-        } else { pending = state; pendingCount = 0 }
+        } else {
+            pending = state
+            pendingCount = 0
+            pendingStart = time
+            pendingContexts = contextLabels
+        }
         if state.recordsEvent {
-            if let index = events.indices.last, events[index].kind == state, time - events[index].end <= 1.6 {
+            if let index = activeEventIndex, events[index].kind == state, continuous {
                 events[index].end = time
                 events[index].speed = speed
                 events[index].rotation = rotation
+                events[index].measuredAt = time
+                events[index].axes = axes
+                events[index].contextLabels = Array(Set((events[index].contextLabels ?? []) + pendingContexts)).sorted()
+                if let name = obstruction.name { events[index].obstructionName = name }
                 events[index].gyroAlsoChanged = events[index].gyroAlsoChanged || changedGyro
             } else {
-                events.append(WalkEvent(start: max(0, lastTime.isFinite ? lastTime : time - 1), end: time, kind: state,
-                    speed: speed, rotation: rotation, obstructionName: obstruction.name, gyroAlsoChanged: changedGyro))
+                events.append(WalkEvent(start: pendingStart, end: time, kind: state,
+                    speed: speed, rotation: rotation, obstructionName: obstruction.name, gyroAlsoChanged: changedGyro,
+                    measuredAt: time, axes: axes, baselineSpeed: baseline.meanSpeed,
+                    baselineRotation: baseline.rotationRMS, baselineAxes: baselineAxes, contextLabels: pendingContexts))
+                activeEventIndex = events.count - 1
             }
-        }
+        } else { activeEventIndex = nil }
         lastTime = time
         return WalkWindow(time: time, speed: speed, rotation: rotation, axes: axes,
             positionCoverage: pCoverage, motionCoverage: mCoverage, obstruction: obstruction.state,

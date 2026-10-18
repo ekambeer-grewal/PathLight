@@ -110,7 +110,7 @@ enum WalkCharts {
             points = record.motion.map { Point(time: $0.time, value: $0.rotation) }
         }
         let reference = speed ? baseline.meanSpeed : baseline.rotationRMS
-        let threshold = speed ? max(0.15, reference * 0.2) : max(0.08, reference * 0.3)
+        let threshold = speed ? WalkThresholds.speed(reference) : WalkThresholds.rotation(reference)
         let maximum = max(0.15, max(reference + threshold, points.compactMap(\.value).max() ?? 0)) * 1.15
         func y(_ value: Double) -> CGFloat { plot.maxY - CGFloat(value / maximum) * plot.height }
         let tint: UIColor = speed ? .systemGreen : .systemCyan
@@ -173,6 +173,119 @@ enum WalkCharts {
 }
 
 enum ReportWriter {
+    /// Monthly exports contain abnormal events only. No normal/speed-only/gyro-only rows
+    /// or whole-walk averages are included in either chart or event table.
+    static func writeMonthly(report: MonthlyMovementReport, archive: SavedState) throws -> URL {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("PathLightReports")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let filename = DateFormatter()
+        filename.locale = Locale(identifier: "en_US_POSIX")
+        filename.calendar = report.calendar
+        filename.timeZone = report.calendar.timeZone
+        filename.dateFormat = "yyyy-MM"
+        let url = folder.appendingPathComponent("PathLight-Monthly-\(filename.string(from: report.month))-\(UUID().uuidString.prefix(8)).pdf")
+        let format = UIGraphicsPDFRendererFormat()
+        format.documentInfo = [kCGPDFContextTitle as String: "PathLight - \(report.title) - Abnormal movement",
+                               kCGPDFContextCreator as String: "PathLight"]
+        let renderer = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 612, height: 792), format: format)
+        let days = report.days
+        let pageCount = 1 + Int(ceil(Double(report.entries.count) / 6))
+        var references: [UUID: WalkRecord] = [:]
+        for baseline in (archive.baselineHistory ?? []) + (archive.baseline.map { [$0] } ?? []) {
+            references[baseline.id] = baseline
+        }
+        try renderer.writePDF(to: url) { pdf in
+            var page = 0
+            func label(_ text: String, _ rect: CGRect, size: CGFloat = 10, bold: Bool = false,
+                       color: UIColor = .black) {
+                let paragraph = NSMutableParagraphStyle()
+                paragraph.lineBreakMode = .byWordWrapping
+                (text as NSString).draw(in: rect, withAttributes: [
+                    .font: UIFont.systemFont(ofSize: size, weight: bold ? .semibold : .regular),
+                    .foregroundColor: color, .paragraphStyle: paragraph])
+            }
+            func newPage(_ title: String) {
+                pdf.beginPage(); page += 1
+                label("PATHLIGHT / MONTHLY ABNORMAL MOVEMENT", CGRect(x: 36, y: 25, width: 540, height: 16), size: 10, bold: true)
+                label(title, CGRect(x: 36, y: 49, width: 540, height: 32), size: 24, bold: true)
+                label("Sensor threshold flags - not a diagnosis. Page \(page) of \(pageCount)",
+                      CGRect(x: 36, y: 759, width: 540, height: 15), size: 9, color: .darkGray)
+            }
+            newPage(report.title)
+            let metrics = [("ABNORMAL EVENTS", String(report.entries.count)),
+                           ("WALKS WITH EVENTS", String(report.walkCount)),
+                           ("FLAGGED TIME", WalkRecord.clock(report.totalSeconds)),
+                           ("DAYS WITH EVENTS", String(days.filter { $0.count > 0 }.count))]
+            for (index, metric) in metrics.enumerated() {
+                let x = 36 + CGFloat(index) * 137
+                label(metric.0, CGRect(x: x, y: 94, width: 130, height: 16), size: 8, color: .darkGray)
+                label(metric.1, CGRect(x: x, y: 113, width: 130, height: 30), size: 23, bold: true)
+            }
+            label("Confirmed abnormal events across saved walks. Dates use \(report.calendar.timeZone.identifier).",
+                  CGRect(x: 36, y: 153, width: 540, height: 28), size: 10)
+            MonthlyWalkCharts.draw(days: days, duration: false, rect: CGRect(x: 36, y: 188, width: 540, height: 196), context: pdf.cgContext)
+            MonthlyWalkCharts.draw(days: days, duration: true, rect: CGRect(x: 36, y: 395, width: 540, height: 196), context: pdf.cgContext)
+            label(WalkThresholds.explanation, CGRect(x: 36, y: 607, width: 540, height: 62), size: 9)
+            label("Events start at the first qualifying evaluation after confirmation; durations cover confirmed evaluation timestamps. Counts and full event durations are assigned to the event's start day/month. Turns, pauses and nearby obstructions are retained as context.",
+                  CGRect(x: 36, y: 674, width: 540, height: 42), size: 9, color: .darkGray)
+            label("Zero means no saved abnormal event, not verified normal walking. Only retained recordings are included.",
+                  CGRect(x: 36, y: 724, width: 540, height: 24), size: 9, color: .darkGray)
+
+            for first in stride(from: 0, to: report.entries.count, by: 6) {
+                newPage("Abnormal movement records")
+                label("START / END (UTC OFFSET)", CGRect(x: 46, y: 96, width: 196, height: 15), size: 8, bold: true)
+                label("EVENT / WALK", CGRect(x: 247, y: 96, width: 180, height: 15), size: 8, bold: true)
+                label("SPEED m/s", CGRect(x: 435, y: 96, width: 64, height: 15), size: 8, bold: true)
+                label("GYRO rad/s", CGRect(x: 503, y: 96, width: 70, height: 15), size: 8, bold: true)
+                for (row, entry) in report.entries[first..<min(first + 6, report.entries.count)].enumerated() {
+                    let y = 120 + CGFloat(row) * 96
+                    let event = entry.event
+                    let baseline = entry.baselineID.flatMap { references[$0] }
+                    UIColor(white: 0.965, alpha: 1).setFill()
+                    pdf.cgContext.fill(CGRect(x: 36, y: y, width: 540, height: 90))
+                    UIColor(red: 0.72, green: 0.10, blue: 0.30, alpha: 1).setFill()
+                    pdf.cgContext.fill(CGRect(x: 36, y: y, width: 3, height: 90))
+                    label(WalkTimestamp.string(entry.date, timeZone: report.calendar.timeZone),
+                          CGRect(x: 46, y: y + 7, width: 196, height: 14), size: 9)
+                    label(WalkTimestamp.string(entry.endDate, timeZone: report.calendar.timeZone),
+                          CGRect(x: 46, y: y + 22, width: 196, height: 14), size: 9)
+                    label("Abnormal movement #\(first + row + 1)", CGRect(x: 247, y: y + 7, width: 180, height: 15), size: 10, bold: true)
+                    let baselineID = entry.baselineID.map { String($0.uuidString.prefix(8)) } ?? "unavailable"
+                    label("Walk \(entry.walkID.uuidString.prefix(8)) / ref \(baselineID)",
+                          CGRect(x: 247, y: y + 23, width: 180, height: 13), size: 8, color: .darkGray)
+                    func reading(_ value: Double?) -> String {
+                        guard let value = value, value.isFinite else { return "--" }
+                        return String(format: "%.2f", value)
+                    }
+                    label(reading(event.speed), CGRect(x: 435, y: y + 7, width: 64, height: 15), size: 11, bold: true)
+                    label(reading(event.rotation), CGRect(x: 503, y: y + 7, width: 70, height: 15), size: 11, bold: true)
+                    label("ref " + reading(event.baselineSpeed ?? baseline?.meanSpeed),
+                          CGRect(x: 435, y: y + 23, width: 64, height: 13), size: 8, color: .darkGray)
+                    label("ref " + reading(event.baselineRotation ?? baseline?.rotationRMS),
+                          CGRect(x: 503, y: y + 23, width: 70, height: 13), size: 8, color: .darkGray)
+                    func axes(_ values: [Double]?) -> String {
+                        guard let values = values, values.count == 3, values.allSatisfy(\.isFinite) else { return "not stored" }
+                        return values.map { String(format: "%.2f", $0) }.joined(separator: " / ")
+                    }
+                    label("Gyro X/Y/Z: \(axes(event.axes))   |   ref: \(axes(event.baselineAxes ?? baseline?.axisRMS)) rad/s RMS",
+                          CGRect(x: 46, y: y + 39, width: 520, height: 13), size: 8)
+                    let measured = event.measuredAt.map {
+                        WalkTimestamp.string(entry.walkDate.addingTimeInterval($0), timeZone: report.calendar.timeZone)
+                    } ?? "not stored (legacy event)"
+                    label(String(format: "Duration %.1f s   |   Last confirmed window: ", event.duration) + measured,
+                          CGRect(x: 46, y: y + 53, width: 520, height: 13), size: 8)
+                    let labels = event.contextLabels ?? []
+                    let context = labels.isEmpty ? "No additional context stored" : labels.joined(separator: "; ")
+                    label(context, CGRect(x: 46, y: y + 67, width: 520, height: 22), size: 8, color: .darkGray)
+                }
+                label("Readings are from the last confirmed 3-second window; ref is the baseline used for that walk. Gyro is RMS phone rotation. An axis can cross its threshold even if total gyro RMS does not. '--' / 'not stored' indicates unavailable historical data.",
+                      CGRect(x: 36, y: 709, width: 540, height: 38), size: 9, color: .darkGray)
+            }
+        }
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path)
+        return url
+    }
+
     static func write(baseline: WalkRecord, current: WalkRecord) throws -> URL {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("PathLightReports")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -201,7 +314,7 @@ enum ReportWriter {
             newPage(current.date.formatted(date: .abbreviated, time: .shortened))
             let metrics = [("DURATION", current.durationText), ("TRACKED DISTANCE", current.trackedDistanceText),
                            ("MEAN SPEED", String(format: "%.2f m/s", current.meanSpeed)),
-                           ("COMBINED EVENTS", "\(current.reviewEvents.count)")]
+                           ("ABNORMAL MOVEMENTS", "\(current.abnormalMovementEvents.count)")]
             for (index, metric) in metrics.enumerated() {
                 let x = 36 + CGFloat(index) * 137
                 label(metric.0, CGRect(x: x, y: 92, width: 132, height: 16), size: 8, color: .darkGray)
@@ -210,22 +323,25 @@ enum ReportWriter {
             chart(.speed, y: 153, height: 205)
             chart(.rotation, y: 364, height: 205)
             chart(.timeline, y: 578, height: 110)
-            label("Pink: combined change   Orange: obstruction slowdown   Green: within thresholds\nCyan: speed change   Purple: gyro change   Yellow: turn / pause\nRed: harness angle   Gray: gathering data / tracking gap",
+            label("Pink: abnormal movement   Orange: obstruction slowdown   Green: within thresholds\nCyan: speed change   Purple: gyro change   Yellow: turn / pause\nRed: harness angle   Gray: gathering data / tracking gap",
                   CGRect(x: 48, y: 698, width: 516, height: 48), size: 9)
             let events = current.events ?? []
             func eventHeader(_ y: CGFloat) {
-                for (title, x, width) in [("TIME", CGFloat(48), CGFloat(95)), ("EVENT", 148, 265), ("SPEED", 420, 76), ("GYRO", 500, 76)] {
+                for (title, x, width) in [("DATE / TIME (UTC OFFSET)", CGFloat(48), CGFloat(164)), ("EVENT", 218, 196), ("SPEED", 420, 76), ("GYRO", 500, 76)] {
                     label(title, CGRect(x: x, y: y, width: width, height: 18), size: 9, bold: true)
                 }
             }
             func eventRow(_ event: WalkEvent, y: CGFloat) {
                 WalkCharts.color(event.kind).setFill()
-                pdf.cgContext.fill(CGRect(x: 36, y: y + 2, width: 4, height: 28))
-                label("\(WalkRecord.clock(event.start))-\(WalkRecord.clock(event.end))", CGRect(x: 48, y: y, width: 95, height: 20), size: 10)
-                label(event.kind.title, CGRect(x: 148, y: y, width: 265, height: 18), size: 11, bold: true)
-                if let name = event.obstructionName, event.kind == .obstructionSlowdown {
-                    label(name + (event.gyroAlsoChanged ? " · gyro also changed" : ""), CGRect(x: 148, y: y + 18, width: 265, height: 17), size: 9, color: .darkGray)
-                }
+                pdf.cgContext.fill(CGRect(x: 36, y: y + 2, width: 4, height: 44))
+                let stamp = WalkTimestamp.string(current.date.addingTimeInterval(event.start)).split(separator: " ")
+                label(String(stamp[0]), CGRect(x: 48, y: y, width: 164, height: 15), size: 10)
+                label(stamp.dropFirst().joined(separator: " "), CGRect(x: 48, y: y + 15, width: 164, height: 15), size: 10)
+                label("Elapsed \(WalkRecord.clock(event.start))-\(WalkRecord.clock(event.end))", CGRect(x: 48, y: y + 30, width: 164, height: 15), size: 8, color: .darkGray)
+                label(event.kind.title, CGRect(x: 218, y: y, width: 196, height: 18), size: 11, bold: true)
+                let context = (event.contextLabels ?? []).joined(separator: "; ")
+                label(context.isEmpty ? (event.obstructionName ?? "") : context,
+                      CGRect(x: 218, y: y + 18, width: 196, height: 28), size: 8, color: .darkGray)
                 label(event.speed.map { String(format: "%.2f m/s", $0) } ?? "--", CGRect(x: 420, y: y, width: 76, height: 20), size: 10)
                 label(event.rotation.map { String(format: "%.2f rad/s", $0) } ?? "--", CGRect(x: 500, y: y, width: 76, height: 20), size: 10)
             }
@@ -236,24 +352,25 @@ enum ReportWriter {
             label(quality, CGRect(x: 36, y: 302, width: 540, height: 20), size: 11, bold: true)
             let status = current.qualityIssues.isEmpty ? "Recording quality gates met; gaps remain visible."
                 : "Limited data: " + current.qualityIssues.joined(separator: " ")
-            label(status, CGRect(x: 36, y: 326, width: 540, height: 32), size: 9)
+            label(status + "\nEvent readings come from the last confirmed window.",
+                  CGRect(x: 36, y: 326, width: 540, height: 32), size: 9)
             eventHeader(370)
             if events.isEmpty {
                 label("No events recorded. This does not establish normal movement.", CGRect(x: 48, y: 402, width: 516, height: 35), size: 11)
             }
-            for (row, event) in events.prefix(6).enumerated() { eventRow(event, y: 400 + CGFloat(row) * 40) }
-            label("3-second windows; changes persist across two evaluations. Speed: >20% and >0.15 m/s. Gyro: >30% and >0.08 rad/s, or axis >40% and >0.10 rad/s. Unvalidated demo thresholds.",
-                  CGRect(x: 36, y: 656, width: 540, height: 35), size: 9)
+            for (row, event) in events.prefix(4).enumerated() { eventRow(event, y: 400 + CGFloat(row) * 58) }
+            label(WalkThresholds.explanation,
+                  CGRect(x: 36, y: 645, width: 540, height: 48), size: 9)
             label("Obstruction timing does not prove cause. Chest-phone motion is not joint motion or an arthritis test. Tracked distance excludes gaps. A 5-second baseline is a short reference.",
                   CGRect(x: 36, y: 698, width: 540, height: 30), size: 9)
             label("Ended: \(current.endReason ?? "Legacy recording") · Session \(current.id.uuidString.prefix(8)) · Baseline \(baseline.id.uuidString.prefix(8))",
                   CGRect(x: 36, y: 737, width: 540, height: 14), size: 8, color: .darkGray)
-            if events.count > 6 {
-                for first in stride(from: 6, to: events.count, by: 14) {
+            if events.count > 4 {
+                for first in stride(from: 4, to: events.count, by: 10) {
                     newPage("Events / continued")
                     eventHeader(98)
-                    for (row, event) in events[first..<min(first + 14, events.count)].enumerated() {
-                        eventRow(event, y: 130 + CGFloat(row) * 43)
+                    for (row, event) in events[first..<min(first + 10, events.count)].enumerated() {
+                        eventRow(event, y: 130 + CGFloat(row) * 58)
                     }
                 }
             }
@@ -264,5 +381,49 @@ enum ReportWriter {
         }
         try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path)
         return url
+    }
+}
+
+/// Vector charts keep printed/exported monthly graphs sharp at any zoom level.
+private enum MonthlyWalkCharts {
+    static func draw(days: [MonthlyMovementReport.Day], duration: Bool, rect: CGRect, context: CGContext) {
+        guard !days.isEmpty else { return }
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.translateBy(x: rect.minX, y: rect.minY)
+        let width = rect.width, height = rect.height
+        func text(_ value: String, x: CGFloat, y: CGFloat, width: CGFloat = 80, size: CGFloat = 9) {
+            (value as NSString).draw(in: CGRect(x: x, y: y, width: width, height: 18), withAttributes: [
+                .font: UIFont.monospacedDigitSystemFont(ofSize: size, weight: .medium),
+                .foregroundColor: UIColor.darkGray])
+        }
+        text(duration ? "Flagged duration by start day (seconds)" : "Abnormal movement events by start day",
+             x: 0, y: 0, width: width, size: 13)
+        let plot = CGRect(x: 48, y: 35, width: width - 62, height: height - 67)
+        let values = days.map { duration ? $0.seconds : Double($0.count) }
+        let maximum = max(duration ? 10.0 : 2.0, (values.max() ?? 0) * 1.15)
+        // Integer event ticks; durations are seconds, never a mislabeled health score.
+        let step = max(1, ceil(maximum / 4))
+        let top = step * 4
+        for index in 0...4 {
+            let y = plot.maxY - CGFloat(index) * plot.height / 4
+            context.setStrokeColor(UIColor(white: 0.85, alpha: 1).cgColor)
+            context.setLineWidth(0.5)
+            context.move(to: CGPoint(x: plot.minX, y: y))
+            context.addLine(to: CGPoint(x: plot.maxX, y: y))
+            context.strokePath()
+            text(String(format: "%.0f", step * Double(index)), x: 0, y: y - 6, width: 44)
+        }
+        let slot = plot.width / CGFloat(days.count)
+        let tint = duration ? UIColor(red: 0.12, green: 0.35, blue: 0.58, alpha: 1)
+                            : UIColor(red: 0.72, green: 0.10, blue: 0.30, alpha: 1)
+        for (index, day) in days.enumerated() {
+            let x = plot.minX + CGFloat(index) * slot
+            let barHeight = CGFloat(values[index] / top) * plot.height
+            tint.setFill()
+            context.fill(CGRect(x: x + 2, y: plot.maxY - barHeight, width: max(1, slot - 4), height: barHeight))
+            text(String(day.number), x: x + 1, y: plot.maxY + 6, width: slot + 1, size: 7)
+        }
+        text("Day of month", x: plot.minX, y: height - 13, width: 180, size: 8)
     }
 }

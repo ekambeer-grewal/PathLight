@@ -24,6 +24,8 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
     @Published var elapsed = 0
     @Published var liveWindow: WalkWindow?
     @Published var liveEventCount = 0
+    @Published var latestAbnormalMovementDate: Date?
+    @Published var exportingReport = false
     @Published var centerDistance: Double?
     @Published var distanceUnit = DistanceUnit.current {
         didSet { UserDefaults.standard.set(distanceUnit.rawValue, forKey: "distance-unit") }
@@ -447,7 +449,7 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
                 motionBucket = MotionBucket()
                 analyzer = WalkAnalyzer()
                 windows = []; contexts = []
-                liveWindow = nil; liveEventCount = 0
+                liveWindow = nil; liveEventCount = 0; latestAbnormalMovementDate = nil
                 lastAnalysisTime = 0
                 recordDate = Date()
                 poseTracker.resetContinuity()
@@ -482,7 +484,9 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
                                        motion: motionSamples, contexts: contexts)
         windows.append(window)
         liveWindow = window
-        liveEventCount = analyzer.events.filter { $0.kind == .combinedChange }.count
+        let abnormalEvents = analyzer.events.filter(\.isAbnormalMovement)
+        liveEventCount = abnormalEvents.count
+        latestAbnormalMovementDate = abnormalEvents.last.map { recordDate.addingTimeInterval($0.start) }
         lastAnalysisTime = time
     }
 
@@ -497,6 +501,8 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
         samples = []; motionSamples = []; windows = []; contexts = []
         motionBucket = MotionBucket()
         liveWindow = nil
+        liveEventCount = 0
+        latestAbnormalMovementDate = nil
         audio.say("Walk canceled.", interrupt: true)
     }
 
@@ -523,11 +529,9 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
                 audio.say("Please repeat the baseline.", interrupt: true)
                 return
             }
-            saved.baseline = record
-            saved.assessments = []
+            saved.replaceBaseline(with: record)
         } else {
             saved.assessments.insert(record, at: 0)
-            saved.assessments = Array(saved.assessments.prefix(20))
         }
         if persist() { audio.say(kind == .baseline ? "Baseline saved." : "Walk saved.", interrupt: true) }
     }
@@ -560,9 +564,38 @@ final class AppModel: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     func export(_ assessment: WalkRecord) {
-        guard let baseline = saved.baseline else { return }
-        do { reportURL = try ReportWriter.write(baseline: baseline, current: assessment) }
-        catch { message = "Report could not be created: \(error.localizedDescription)" }
+        guard let baseline = saved.baseline(for: assessment) else {
+            message = "The baseline used for this walk is unavailable. Its saved abnormal events remain available in monthly reports."
+            return
+        }
+        createReport { try ReportWriter.write(baseline: baseline, current: assessment) }
+    }
+
+    func exportMonth(_ month: Date) {
+        let report = MonthlyMovementReport(records: saved.assessments, month: month)
+        guard !report.entries.isEmpty else {
+            message = "No abnormal movement records were saved for this month."
+            return
+        }
+        // Snapshot the archive before rendering; recordings can continue on the main queue.
+        let archive = saved
+        createReport { try ReportWriter.writeMonthly(report: report, archive: archive) }
+    }
+
+    private func createReport(_ write: @escaping () throws -> URL) {
+        guard !exportingReport else { return }
+        exportingReport = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try write() }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.exportingReport = false
+                switch result {
+                case .success(let url): self.reportURL = url
+                case .failure(let error): self.message = "Report could not be created: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     func sessionWasInterrupted(_ session: ARSession) { stop(reason: "Session interrupted. Tap Start to resume.") }

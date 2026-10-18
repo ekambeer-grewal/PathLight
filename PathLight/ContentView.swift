@@ -210,8 +210,8 @@ struct WalkingView: View {
                 setupCard
             }.padding(20)
         }.background(Color.black).navigationTitle("Walking").navigationBarTitleDisplayMode(.inline)
-            .confirmationDialog("Replace the baseline? A successful new baseline clears earlier walks.", isPresented: $replacing, titleVisibility: .visible) {
-                Button("Record new baseline", role: .destructive) { model.prepareWalk(.baseline) }
+            .confirmationDialog("Record a new baseline? Earlier walks and their baselines will be kept.", isPresented: $replacing, titleVisibility: .visible) {
+                Button("Record new baseline") { model.prepareWalk(.baseline) }
             }
             .confirmationDialog("Discard this walk without saving?", isPresented: $discarding, titleVisibility: .visible) {
                 Button("Discard", role: .destructive) { model.cancelWalk() }
@@ -266,7 +266,8 @@ struct WalkingView: View {
             Text("WALK IN PROGRESS").font(.caption.bold()).foregroundStyle(Color.pink)
             Text(WalkRecord.clock(Double(model.elapsed))).font(.system(size: 48, weight: .semibold, design: .rounded).monospacedDigit())
             if let window = model.liveWindow {
-                LiveWalkStatus(window: window, eventCount: model.liveEventCount)
+                LiveWalkStatus(window: window, eventCount: model.liveEventCount,
+                               latestEventDate: model.latestAbnormalMovementDate)
             }
             Button { model.finishWalk() } label: {
                 Label("End walk & save", systemImage: "stop.fill").font(.headline)
@@ -316,21 +317,51 @@ struct WalkingView: View {
 struct ReportsView: View {
     @ObservedObject var model: AppModel
     @State private var deleting = false
+    @State private var selectedMonth = Calendar.current.dateInterval(of: .month, for: Date())?.start ?? Date()
+    private var monthlyReport: MonthlyMovementReport {
+        MonthlyMovementReport(records: model.saved.assessments, month: selectedMonth)
+    }
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 Text("Summary").font(.system(size: 36, weight: .bold, design: .rounded))
+                monthlyCard
                 Text("YOUR WALKS").font(.caption.bold()).tracking(2).foregroundStyle(Color.pink)
                 emptyCard
                 savedWalks
                 Text("Saved locally. Charts describe tracked movement, not a medical assessment.").font(.footnote).foregroundStyle(.secondary)
                 Button("Delete local walks and reports", role: .destructive) { deleting = true }
-                    .disabled(model.recording != nil || model.countdown > 0)
+                    .disabled(model.recording != nil || model.countdown > 0 || model.exportingReport)
             }.padding(20)
         }.background(Color.black).navigationBarHidden(true)
             .confirmationDialog("Delete baseline, walks and local reports?", isPresented: $deleting, titleVisibility: .visible) {
                 Button("Delete local data", role: .destructive) { model.eraseData() }
             }
+    }
+
+    private var monthlyCard: some View {
+        let report = monthlyReport
+        return VStack(alignment: .leading, spacing: 14) {
+            Label("Monthly report", systemImage: "calendar").font(.title2.bold())
+            Picker("Month", selection: $selectedMonth) {
+                ForEach(MonthlyMovementReport.availableMonths(records: model.saved.assessments), id: \.self) { month in
+                    Text(month.formatted(.dateTime.month(.wide).year())).tag(month)
+                }
+            }.tint(.pink)
+            Text("\(report.entries.count) abnormal movement records across \(report.walkCount) walks")
+                .font(.subheadline)
+            Text("Only abnormal movement records are included, with dates, times and daily graphs. Events are assigned to the month they began.")
+                .font(.footnote).foregroundStyle(.secondary)
+            Button { model.exportMonth(selectedMonth) } label: {
+                Label(model.exportingReport ? "Preparing PDF…" : "Download monthly PDF",
+                      systemImage: "arrow.down.doc")
+                    .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 10)
+            }.buttonStyle(.borderedProminent).tint(.pink)
+                .disabled(report.entries.isEmpty || model.exportingReport)
+            Text(report.entries.isEmpty ? "No abnormal movement records for this month."
+                 : "Choose Save to Files to download, or share the PDF with your doctor.")
+                .font(.caption).foregroundStyle(.secondary)
+        }.card()
     }
 
     @ViewBuilder
@@ -346,13 +377,17 @@ struct ReportsView: View {
 
     @ViewBuilder
     private var savedWalks: some View {
-        if let baseline = model.saved.baseline {
+        LazyVStack(spacing: 20) {
             ForEach(model.saved.assessments) { record in
-                NavigationLink {
-                    WalkDetailView(model: model, record: record, baseline: baseline)
-                } label: {
+                if let baseline = model.saved.baseline(for: record) {
+                    NavigationLink {
+                        WalkDetailView(model: model, record: record, baseline: baseline)
+                    } label: {
+                        WalkSummaryRow(record: record)
+                    }.buttonStyle(.plain)
+                } else {
                     WalkSummaryRow(record: record)
-                }.buttonStyle(.plain)
+                }
             }
         }
     }
@@ -373,6 +408,7 @@ private struct WalkDetailView: View {
                 qualityCard
                 chartCards
                 timelineKey
+                abnormalEventsCard
                 eventsCard
                 shareButton
                 Text("Lines use 3-second windows. Missing data breaks the line. Obstruction slowdowns indicate timing, not a proven cause. Gyroscope measurements are chest-phone motion, not direct joint or clinical gait measurements.")
@@ -408,7 +444,7 @@ private struct WalkDetailView: View {
             summaryStat("DURATION", record.durationText, .cyan)
             summaryStat("TRACKED DISTANCE", record.trackedDistanceText, .green)
             summaryStat("MEAN SPEED", String(format: "%.2f m/s", record.meanSpeed), .yellow)
-            summaryStat("COMBINED EVENTS", "\(record.reviewEvents.count)", .pink)
+            summaryStat("ABNORMAL MOVEMENTS", "\(record.abnormalMovementEvents.count)", .pink)
         }
     }
 
@@ -440,14 +476,29 @@ private struct WalkDetailView: View {
     }
 
     @ViewBuilder
+    private var abnormalEventsCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("Abnormal movement", systemImage: "waveform.path.ecg").font(.title2.bold())
+            Text("Both speed and gyroscope thresholds exceeded. Sensor flags are not a diagnosis.")
+                .font(.footnote).foregroundStyle(.secondary)
+            if record.abnormalMovementEvents.isEmpty {
+                Text("No abnormal movement recorded.").font(.footnote).foregroundStyle(.secondary)
+            }
+            ForEach(record.abnormalMovementEvents) { event in
+                WalkEventRow(event: event, walkDate: record.date)
+            }
+        }.card()
+    }
+
+    @ViewBuilder
     private var eventsCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Events").font(.title2.bold())
-            if (record.events ?? []).isEmpty {
-                Text("No events recorded. This does not establish normal movement.").font(.footnote).foregroundStyle(.secondary)
+            Text("Other observations").font(.title2.bold())
+            if events.filter({ !$0.isAbnormalMovement }).isEmpty {
+                Text("No other observations recorded.").font(.footnote).foregroundStyle(.secondary)
             }
-            ForEach(events) { event in
-                WalkEventRow(event: event)
+            ForEach(events.filter { !$0.isAbnormalMovement }) { event in
+                WalkEventRow(event: event, walkDate: record.date)
             }
         }.card()
     }
@@ -458,6 +509,7 @@ private struct WalkDetailView: View {
             Label("Share PDF with charts", systemImage: "square.and.arrow.up")
                 .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 12)
         }.buttonStyle(.borderedProminent).tint(Color.green).foregroundStyle(Color.black)
+            .disabled(model.exportingReport)
     }
 
 }
@@ -467,7 +519,7 @@ private struct WalkSummaryRow: View {
     private var eventSummary: String {
         let combined: Int = record.reviewEvents.count
         let slowdowns: Int = (record.events ?? []).filter { $0.kind == .obstructionSlowdown }.count
-        return "\(combined) combined movement events · \(slowdowns) obstruction slowdowns"
+        return "\(combined) abnormal movements · \(slowdowns) obstruction slowdowns"
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -492,6 +544,7 @@ private struct WalkSummaryRow: View {
 
 private struct WalkEventRow: View {
     let event: WalkEvent
+    let walkDate: Date
     private var timeText: String {
         WalkRecord.clock(event.start) + "–" + WalkRecord.clock(event.end)
     }
@@ -511,8 +564,17 @@ private struct WalkEventRow: View {
                 .fill(Color(uiColor: WalkCharts.color(event.kind))).frame(width: 4, height: 42)
             VStack(alignment: .leading, spacing: 4) {
                 Text(event.kind.title).font(.headline)
-                Text(timeText).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                Text(WalkTimestamp.string(walkDate.addingTimeInterval(event.start)))
+                    .font(.caption.monospacedDigit())
+                Text("Elapsed " + timeText + " · " + String(format: "%.1f seconds", event.duration))
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 Text(readingsText).font(.caption).foregroundStyle(.secondary)
+                if event.isAbnormalMovement {
+                    Text("Last confirmed window readings").font(.caption2).foregroundStyle(.secondary)
+                    if let labels = event.contextLabels, !labels.isEmpty {
+                        Text(labels.joined(separator: " · ")).font(.caption).foregroundStyle(Color.orange)
+                    }
+                }
                 if event.kind == .obstructionSlowdown {
                     Text(contextText).font(.caption).foregroundStyle(Color.orange)
                 }
@@ -524,15 +586,36 @@ private struct WalkEventRow: View {
 private struct LiveWalkStatus: View {
     let window: WalkWindow
     let eventCount: Int
+    let latestEventDate: Date?
+    private var confirmingAbnormalMovement: Bool {
+        window.state == .warmingUp && window.time >= WalkThresholds.windowSeconds
+            && window.positionCoverage >= WalkThresholds.minimumCoverage
+            && window.motionCoverage >= WalkThresholds.minimumCoverage
+            && window.speedChanged && window.gyroChanged
+    }
     private var gyroText: String {
         guard let rotation = window.rotation else { return "Waiting for usable motion data" }
-        return String(format: "Gyro %.2f rad/s", rotation) + " · \(eventCount) combined events"
+        return String(format: "Gyro %.2f rad/s", rotation) + " · \(eventCount) abnormal movements"
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label(window.state.title, systemImage: "waveform.path")
+            Label(confirmingAbnormalMovement ? "Confirming abnormal movement" : window.state.title, systemImage: "waveform.path")
                 .foregroundStyle(Color(uiColor: WalkCharts.color(window.state))).font(.headline)
+            if let speed = window.speed {
+                Text(String(format: "Window speed %.2f m/s", speed)).font(.footnote).foregroundStyle(.secondary)
+            }
             Text(gyroText).font(.footnote).foregroundStyle(.secondary)
+            if confirmingAbnormalMovement {
+                Text("Both thresholds exceeded; waiting for the next consecutive evaluation.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            if window.state == .combinedChange {
+                Text("Speed and gyroscope changes both exceeded thresholds.").font(.footnote).foregroundStyle(.pink)
+            }
+            if let date = latestEventDate {
+                Text("Latest abnormal movement: " + WalkTimestamp.string(date))
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
             if window.obstruction == .detected {
                 Text("Nearby obstruction detected. A slowdown may be related.").font(.footnote).foregroundStyle(Color.orange)
             } else if window.obstruction == .unavailable {

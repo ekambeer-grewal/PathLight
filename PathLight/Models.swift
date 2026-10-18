@@ -112,7 +112,8 @@ struct WalkRecord: Codable, Identifiable {
         return value >= 3600 ? String(format: "%d:%02d:%02d", value / 3600, value / 60 % 60, value % 60)
             : String(format: "%d:%02d", value / 60, value % 60)
     }
-    var reviewEvents: [WalkEvent] { (events ?? []).filter { $0.kind == .combinedChange } }
+    var abnormalMovementEvents: [WalkEvent] { (events ?? []).filter(\.isAbnormalMovement) }
+    var reviewEvents: [WalkEvent] { abnormalMovementEvents }
     var trackedDistanceText: String { DistanceUnit.current.label(distance) }
     var accelerationRMS: Double { rms(motion.map(\.acceleration)) }
     var meanTilt: Double { motion.map(\.tilt).reduce(0, +) / Double(max(1, motion.count)) }
@@ -166,7 +167,9 @@ struct Comparison {
     var flags: [String] {
         guard comparabilityIssues.isEmpty else { return [] }
         if (current.algorithmVersion ?? 1) >= 3 {
-            return current.reviewEvents.map { "Speed + gyro change at " + WalkRecord.clock($0.start) }
+            return current.abnormalMovementEvents.map {
+                "Abnormal movement at " + WalkTimestamp.string(current.date.addingTimeInterval($0.start))
+            }
         }
         var result: [String] = []
         if abs(current.meanSpeed - baseline.meanSpeed) > max(0.15, baseline.meanSpeed * 0.2) {
@@ -185,7 +188,10 @@ struct Comparison {
     }
     var headline: String {
         if !comparabilityIssues.isEmpty { return "Repeat recording — comparison unavailable" }
-        return flags.isEmpty ? "No combined change flagged" : "Movement change — review suggested"
+        if (current.algorithmVersion ?? 1) >= 3 {
+            return flags.isEmpty ? "No abnormal movement flagged" : "Abnormal movement — review suggested"
+        }
+        return flags.isEmpty ? "No movement change flagged" : "Movement change — review suggested"
     }
     static let limitation = "Experimental, unvalidated thresholds show changes in phone-derived measurements. They do not detect, diagnose, rule out, or estimate the risk of arthritis or any other disease. A single walk is not an established clinical baseline. Speed, fatigue, route, footwear, turns, and harness movement can change results."
 }
@@ -193,6 +199,23 @@ struct Comparison {
 struct SavedState: Codable {
     var baseline: WalkRecord?
     var assessments: [WalkRecord] = []
+    // Optional so archives made before monthly reporting continue to decode.
+    var baselineHistory: [WalkRecord]? = nil
+
+    func baseline(for record: WalkRecord) -> WalkRecord? {
+        guard let id = record.baselineID else { return nil }
+        if baseline?.id == id { return baseline }
+        return baselineHistory?.first { $0.id == id }
+    }
+
+    mutating func replaceBaseline(with record: WalkRecord) {
+        if let previous = baseline, previous.id != record.id {
+            var history = baselineHistory ?? []
+            if !history.contains(where: { $0.id == previous.id }) { history.append(previous) }
+            baselineHistory = history
+        }
+        baseline = record
+    }
 }
 
 
@@ -204,7 +227,8 @@ enum WalkState: String, Codable, CaseIterable {
         case .steady: return "Within demo thresholds"
         case .speedChange: return "Speed change"
         case .gyroChange: return "Gyroscope change"
-        case .combinedChange: return "Speed + gyro change"
+        // Keep the stored raw value for compatibility with existing recordings.
+        case .combinedChange: return "Abnormal movement"
         case .obstructionSlowdown: return "Slowdown near obstruction"
         case .turning: return "Turning"
         case .paused: return "Pause / very slow movement"
@@ -246,5 +270,99 @@ struct WalkEvent: Codable, Identifiable {
     var rotation: Double?
     var obstructionName: String?
     var gyroAlsoChanged: Bool
+    // Readings are from the last confirmed window, not peak values or a whole-event average.
+    // Optional additions preserve decoding of older saved events.
+    var measuredAt: Double? = nil
+    var axes: [Double]? = nil
+    var baselineSpeed: Double? = nil
+    var baselineRotation: Double? = nil
+    var baselineAxes: [Double]? = nil
+    var contextLabels: [String]? = nil
     var duration: Double { max(0, end - start) }
+    var isAbnormalMovement: Bool { kind == .combinedChange }
+}
+
+/// Shared engineering thresholds for live classification and report explanations.
+enum WalkThresholds {
+    static let windowSeconds = 3.0
+    static let minimumCoverage = 0.7
+    static let maximumEvaluationGap = 1.6
+    static func speed(_ baseline: Double) -> Double { max(0.15, baseline * 0.2) }
+    static func rotation(_ baseline: Double) -> Double { max(0.08, baseline * 0.3) }
+    static func axis(_ baseline: Double) -> Double { max(0.10, baseline * 0.4) }
+    static let explanation = "Abnormal movement means both speed and gyroscope changes exceeded their baseline thresholds in two consecutive evaluations of 3-second windows. Speed: >20% and >0.15 m/s. Gyro RMS: >30% and >0.08 rad/s, or an axis: >40% and >0.10 rad/s. These are unvalidated sensor flags, not a diagnosis."
+}
+
+enum WalkTimestamp {
+    static func string(_ date: Date, timeZone: TimeZone = .current) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = timeZone
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss XXX"
+        return formatter.string(from: date)
+    }
+}
+
+/// Only confirmed abnormal events enter this report. Month membership uses event onset,
+/// not the date the walk began, so walks spanning midnight/month boundaries are handled.
+struct MonthlyMovementReport {
+    struct Entry: Identifiable {
+        let walkID: UUID
+        let walkDate: Date
+        let baselineID: UUID?
+        let event: WalkEvent
+        var id: String { "\(walkID.uuidString)-\(event.start)" }
+        var date: Date { walkDate.addingTimeInterval(event.start) }
+        var endDate: Date { walkDate.addingTimeInterval(event.end) }
+    }
+    struct Day {
+        let number: Int
+        let count: Int
+        let seconds: Double
+    }
+    let month: Date
+    let calendar: Calendar
+    let entries: [Entry]
+
+    init(records: [WalkRecord], month: Date, calendar: Calendar = .current) {
+        self.calendar = calendar
+        let interval = calendar.dateInterval(of: .month, for: month)
+            ?? DateInterval(start: month, duration: 0)
+        self.month = interval.start
+        entries = records.filter { $0.kind == .assessment }.flatMap { record in
+            record.abnormalMovementEvents.compactMap { event -> Entry? in
+                guard event.start.isFinite, event.end.isFinite,
+                      event.start >= 0, event.end >= event.start else { return nil }
+                let entry = Entry(walkID: record.id, walkDate: record.date,
+                                  baselineID: record.baselineID, event: event)
+                guard entry.date >= interval.start, entry.date < interval.end else { return nil }
+                return entry
+            }
+        }.sorted { $0.date < $1.date }
+    }
+
+    var walkCount: Int { Set(entries.map(\.walkID)).count }
+    var totalSeconds: Double { entries.reduce(0) { $0 + $1.event.duration } }
+    var days: [Day] {
+        let grouped = Dictionary(grouping: entries) { calendar.component(.day, from: $0.date) }
+        return (calendar.range(of: .day, in: .month, for: month) ?? 1..<1).map { day in
+            let values = grouped[day] ?? []
+            return Day(number: day, count: values.count, seconds: values.reduce(0) { $0 + $1.event.duration })
+        }
+    }
+    var title: String {
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.dateFormat = "LLLL yyyy"
+        return formatter.string(from: month)
+    }
+    static func availableMonths(records: [WalkRecord], now: Date = Date(), calendar: Calendar = .current) -> [Date] {
+        let dates = [now] + records.map(\.date) + records.flatMap { record in
+            record.abnormalMovementEvents.filter { $0.start.isFinite && $0.start >= 0 }
+                .map { record.date.addingTimeInterval($0.start) }
+        }
+        return Array(Set(dates.compactMap { calendar.dateInterval(of: .month, for: $0)?.start })).sorted(by: >)
+    }
 }
